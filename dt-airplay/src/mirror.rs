@@ -335,7 +335,10 @@ pub struct MirrorSession {
     timestamp_bias: Duration,
     pub media_clock: Option<MediaClock>,
 
-    timing_socket: Option<UdpSocket>,
+    /// Reserved timing socket; kept alive for the session's lifetime (the NTP
+    /// responder holds its own clone, but the original must not be dropped
+    /// while legacy receivers may still probe it).
+    _timing_socket: Option<UdpSocket>,
 }
 
 /// Negotiates a mirroring session with the receiver.
@@ -432,7 +435,7 @@ pub fn setup_mirror_session(
     let mut receiver_event_port = 0;
     let mut skip_record = false;
 
-    let mut send_setup = |client: &mut Client,
+    let send_setup = |client: &mut Client,
                           uri: &str,
                           phase: &str,
                           request: &Value,
@@ -460,7 +463,7 @@ pub fn setup_mirror_session(
         Ok((response, headers, received_at))
     };
 
-    let mut record_session = |client: &mut Client| -> Result<()> {
+    let record_session = |client: &mut Client| -> Result<()> {
         let mut headers = std::collections::HashMap::new();
         headers.insert("Session".into(), session_uuid.clone());
         headers.insert("Range".into(), "npt=0-".into());
@@ -668,7 +671,7 @@ pub fn setup_mirror_session(
         first_frame_sent: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         timestamp_bias: session_latency,
         media_clock,
-        timing_socket: Some(timing_socket),
+        _timing_socket: Some(timing_socket),
     })
 }
 

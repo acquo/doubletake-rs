@@ -162,7 +162,6 @@ impl EventChannel {
 
 /// A receiver-to-sender event command.
 struct EventRequest {
-    method: String,
     cseq: u64,
     body_length: usize,
 }
@@ -199,7 +198,6 @@ fn read_event_request(reader: &mut std::io::BufReader<EventChannel>) -> Result<E
         return Err(Error::Protocol(format!("invalid event request line {request_line:?}")));
     }
     let mut request = EventRequest {
-        method: parts[0].to_string(),
         cseq: 0,
         body_length: 0,
     };
@@ -255,7 +253,7 @@ fn read_event_request(reader: &mut std::io::BufReader<EventChannel>) -> Result<E
 
 /// Serves receiver-to-sender commands until the channel closes, acknowledging
 /// each with `RTSP/1.0 200 OK`. Runs on a background thread.
-pub fn serve_event_channel(mut channel: EventChannel) {
+pub fn serve_event_channel(channel: EventChannel) {
     std::thread::spawn(move || {
         let mut reader = std::io::BufReader::new(channel);
         loop {

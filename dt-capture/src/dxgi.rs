@@ -6,7 +6,7 @@
 //! - [`DesktopDuplicator::acquire_frame_cpu`]: tightly-packed BGRA8 frames
 //!   read back to the CPU, for software encoders (e.g. OpenH264).
 
-use windows::core::{Interface, Result as WinResult};
+use windows::core::Interface;
 use windows::Win32::Foundation::RECT;
 use windows::Win32::Graphics::Direct3D::{
     D3D_DRIVER_TYPE_HARDWARE, D3D_FEATURE_LEVEL_10_0, D3D_FEATURE_LEVEL_11_0,
@@ -24,6 +24,8 @@ use windows::Win32::Graphics::Dxgi::{
     DXGI_ERROR_ACCESS_LOST, DXGI_ERROR_WAIT_TIMEOUT, DXGI_OUTDUPL_FRAME_INFO,
 };
 use std::ffi::c_void;
+
+use crate::cursor::CursorOverlay;
 
 #[derive(Debug, thiserror::Error)]
 pub enum DxgiError {
@@ -55,6 +57,8 @@ pub struct DesktopDuplicator {
     duplication: IDXGIOutputDuplication,
     /// Lazily-created staging texture for CPU readback.
     staging: Option<ID3D11Texture2D>,
+    /// Cursor shape/position overlay (blended into CPU frames).
+    cursor: CursorOverlay,
     pub width: u32,
     pub height: u32,
 }
@@ -97,6 +101,7 @@ impl DesktopDuplicator {
             context,
             duplication,
             staging: None,
+            cursor: CursorOverlay::default(),
             width,
             height,
         })
@@ -104,12 +109,19 @@ impl DesktopDuplicator {
 
     /// The D3D11 device that owns captured textures (shared with NVENC).
     pub fn device_raw(&self) -> *mut c_void {
-        unsafe { self.device.as_raw() as *mut c_void }
+        self.device.as_raw() as *mut c_void
     }
 
     /// Waits up to `timeout_ms` for a new desktop frame. Returns the texture
     /// (valid until [`DesktopDuplicator::release_frame`]).
     pub fn acquire_frame(&mut self, timeout_ms: u32) -> Result<Option<ID3D11Texture2D>, DxgiError> {
+        Ok(self.acquire_with_info(timeout_ms)?.map(|(t, _)| t))
+    }
+
+    fn acquire_with_info(
+        &mut self,
+        timeout_ms: u32,
+    ) -> Result<Option<(ID3D11Texture2D, DXGI_OUTDUPL_FRAME_INFO)>, DxgiError> {
         let mut info: DXGI_OUTDUPL_FRAME_INFO = unsafe { std::mem::zeroed() };
         let mut resource: Option<IDXGIResource> = None;
         match unsafe { self.duplication.AcquireNextFrame(timeout_ms, &mut info, &mut resource) } {
@@ -122,7 +134,7 @@ impl DesktopDuplicator {
             return Ok(None);
         };
         let texture: ID3D11Texture2D = resource.cast()?;
-        Ok(Some(texture))
+        Ok(Some((texture, info)))
     }
 
     /// Releases the last acquired frame (required before the next acquire).
@@ -133,14 +145,24 @@ impl DesktopDuplicator {
     }
 
     /// Waits up to `timeout_ms` for a new desktop frame, read back to the CPU
-    /// as tightly-packed BGRA8 (for software encoders).
+    /// as tightly-packed BGRA8 with the mouse cursor blended in (for software
+    /// encoders).
     ///
     /// `Ok(None)` means the timeout elapsed without a new frame.
     pub fn acquire_frame_cpu(&mut self, timeout_ms: u32) -> Result<Option<CpuFrame>, DxgiError> {
-        let Some(texture) = self.acquire_frame(timeout_ms)? else {
+        let Some((texture, info)) = self.acquire_with_info(timeout_ms)? else {
             return Ok(None);
         };
         let result = self.readback_cpu(&texture);
+        if let Ok(mut frame) = result {
+            // Track the pointer (position/shape) and draw it into the frame.
+            if let Err(e) = self.cursor.update(&info, &self.duplication) {
+                log::warn!("cursor update failed: {e}");
+            }
+            self.cursor.draw(&mut frame.bgra, frame.width, frame.height);
+            self.release_frame();
+            return Ok(Some(frame));
+        }
         self.release_frame();
         result.map(Some)
     }

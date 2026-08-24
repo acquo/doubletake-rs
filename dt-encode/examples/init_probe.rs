@@ -26,7 +26,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         )?;
     }
     let device = device.expect("device");
-    let raw = unsafe { device.as_raw() as *mut c_void };
+    let raw = device.as_raw() as *mut c_void;
     let nv = Arc::new(NvEncoder::load()?);
     let session = nv.open_session(raw, NV_ENC_DEVICE_TYPE_DIRECTX)?;
 

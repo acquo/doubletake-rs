@@ -63,7 +63,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         )?;
     }
     let device = device.ok_or("D3D11CreateDevice returned no device")?;
-    let raw_device = unsafe { device.as_raw() as *mut c_void };
+    let raw_device = device.as_raw() as *mut c_void;
     println!("  D3D11 device created (raw {:?})", raw_device);
 
     println!("\n=== open encode session (device type probe) ===");

@@ -25,6 +25,24 @@ impl H264Parser {
         }
     }
 
+    /// Forces out any NALs still buffered (end-of-stream / idle flush).
+    ///
+    /// The parser only returns a NAL once the next start code has been seen;
+    /// this appends a sentinel to close the final NAL and returns everything
+    /// complete. The sentinel is removed from the buffer afterwards.
+    pub fn flush(&mut self) -> Vec<Vec<u8>> {
+        if self.buf.is_empty() {
+            return Vec::new();
+        }
+        self.buf.extend_from_slice(&[0, 0, 1, 0]); // sentinel start code
+        let out = self.push_annex_b();
+        // Drop the sentinel tail that push_annex_b could not close.
+        if self.buf.as_slice() == [0, 0, 1, 0] {
+            self.buf.clear();
+        }
+        out
+    }
+
     fn push_annex_b(&mut self) -> Vec<Vec<u8>> {
         let mut out = Vec::new();
         loop {
@@ -366,6 +384,26 @@ mod tests {
         assert_eq!(nals.len(), 1);
         // AVCC parser re-wraps with 4-byte length prefix.
         assert_eq!(strip_start_code(&nals[0]), &[0x65, 1, 2]);
+    }
+
+    #[test]
+    fn flush_returns_buffered_nals() {
+        // A stream whose final NAL is only returned by flush().
+        let mut stream = vec![0u8; 0];
+        stream.extend_from_slice(&[0, 0, 0, 1, 0x67, 1, 2, 3]);
+        stream.extend_from_slice(&[0, 0, 1, 0x65, 6, 7, 8]);
+
+        let mut parser = H264Parser::new();
+        // The SPS is closed by the IDR's start code; the IDR stays buffered.
+        let nals = parser.push(&stream);
+        assert_eq!(nals.len(), 1);
+        assert_eq!(nal_type(&nals[0]), 7);
+        let nals = parser.flush();
+        assert_eq!(nals.len(), 1);
+        assert_eq!(nal_type(&nals[0]), 5);
+        // The sentinel must not leak into the next push.
+        let again = parser.push(&[0, 0, 1, 0x61, 0]);
+        assert!(again.is_empty(), "no junk NAL from the flush sentinel");
     }
 
     #[test]

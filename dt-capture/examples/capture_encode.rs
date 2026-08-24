@@ -46,7 +46,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     while start.elapsed() < Duration::from_secs(seconds) {
         match dup.acquire_frame(100)? {
             Some(texture) => {
-                let raw = unsafe { windows::core::Interface::as_raw(&texture) as *mut std::ffi::c_void };
+                let raw = windows::core::Interface::as_raw(&texture) as *mut std::ffi::c_void;
                 if !registered {
                     encoder.register_texture(raw)?;
                     registered = true;

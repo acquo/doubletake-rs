@@ -5,8 +5,10 @@ use std::sync::atomic::{AtomicI64, Ordering};
 pub const DEFAULT_TARGET_LATENCY_NS: i64 = 1_000_000; // 1 ms
 
 /// Conservative playout lead for receivers without a robust jitter buffer
-/// (third-party AirPlay implementations such as Roku).
-pub const CONSERVATIVE_PLAYOUT_LATENCY_NS: i64 = 500_000_000; // 500 ms
+/// (third-party AirPlay implementations such as Roku). 100 ms matches the
+/// upstream doubletake fork's `-target-latency-ms` default; larger values
+/// (the original 500 ms) add noticeable video lag on video-only sessions.
+pub const CONSERVATIVE_PLAYOUT_LATENCY_NS: i64 = 100_000_000; // 100 ms
 
 static TARGET_LATENCY_NS: AtomicI64 = AtomicI64::new(DEFAULT_TARGET_LATENCY_NS);
 

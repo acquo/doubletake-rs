@@ -6,8 +6,7 @@
 
 use crate::nvenc::{
     h264_guid, nvencapi_struct_version, NvEncoder, NvEncoderError, NV_ENC_BUFFER_FORMAT_ARGB,
-    NV_ENC_H264_ENTROPY_CODING_MODE_CABAC, NV_ENC_INPUT_IMAGE,
-    NV_ENC_INPUT_RESOURCE_TYPE_DIRECTX, NV_ENC_PARAMS_RC_CBR, NV_ENC_PIC_FLAG_FORCEIDR,
+    NV_ENC_INPUT_IMAGE, NV_ENC_INPUT_RESOURCE_TYPE_DIRECTX, NV_ENC_PIC_FLAG_FORCEIDR,
     NV_ENC_PIC_STRUCT_FRAME, NV_ENC_SUCCESS,
 };
 use crate::nvenc::nvenc_bindings as nv;
@@ -74,7 +73,7 @@ impl H264Encoder {
         height: u32,
         fps: u32,
         _bitrate: u32,
-        buffer_format: u32,
+        _buffer_format: u32,
     ) -> Result<Self, NvEncoderError> {
         let session = nv.open_session(device, crate::nvenc::NV_ENC_DEVICE_TYPE_DIRECTX)?;
 

@@ -378,6 +378,28 @@ impl PairingSession {
         self.perform_transient_setup_and_verify(transport)
     }
 
+    /// Re-establishes pairing using previously saved credentials (no PIN
+    /// needed). Load `pairing_id`, `keys.ed25519_seed` and
+    /// `keys.ed25519_public` from the credential store first.
+    ///
+    /// Modern receivers verify with the TLV pair-verify exchange; if the
+    /// receiver rejects it (AirMyPC-style legacy receivers), falls back to the
+    /// raw binary variant which leaves the channel in plaintext.
+    pub fn reconnect(&mut self, transport: &mut dyn Transport) -> Result<()> {
+        if self.keys.ed25519_seed.len() != 32 || self.pairing_id.is_empty() {
+            return Err(Error::Protocol(
+                "reconnect requires saved pairing_id + ed25519_seed".into(),
+            ));
+        }
+        match self.pair_verify(transport) {
+            Ok(()) => Ok(()),
+            Err(tlv_err) => {
+                log::info!("TLV pair-verify failed ({tlv_err}); falling back to raw legacy verify");
+                self.raw_pair_verify(transport)
+            }
+        }
+    }
+
     fn perform_transient_setup_and_verify(&mut self, transport: &mut dyn Transport) -> Result<()> {
         let modern_transient = self
             .info

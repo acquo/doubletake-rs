@@ -7,7 +7,9 @@
 //! SDK denotes a DirectX (D3D11) device.
 
 pub mod nvenc_bindings {
-    #![allow(non_camel_case_types, non_snake_case, dead_code, non_upper_case_globals)]
+    // Generated bindgen output: silence every lint (transmute hints from
+    // newer rustc, unused items, naming style, etc.).
+    #![allow(warnings)]
     include!(concat!(env!("OUT_DIR"), "/nvenc_bindings.rs"));
 }
 

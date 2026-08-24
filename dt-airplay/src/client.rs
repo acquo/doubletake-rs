@@ -280,11 +280,14 @@ impl Client {
         if self.encrypted {
             buf = self.hap_encrypt(&buf);
         }
+        log::debug!("RTSP {method} {uri} ({} body bytes, encrypted={})", body.len(), self.encrypted);
         self.stream
             .write_all(&buf)
             .map_err(|e| Error::from_io("write request", e))?;
 
-        self.read_response()
+        let resp = self.read_response()?;
+        log::debug!("RTSP {method} {uri} -> {}", resp.status);
+        Ok(resp)
     }
 
     /// HAP encrypted frame format: split plaintext into max-1024-byte chunks;
