@@ -14,3 +14,9 @@ license = "GPL-3.0-or-later"
 
 [profile.release]
 lto = true
+
+# Video conversion/encoding is CPU-bound: dev builds are ~10-70x slower
+# without optimizations, so keep a modest opt level for usable debug runs.
+# Use `--release` for the real mirror session.
+[profile.dev]
+opt-level = 1

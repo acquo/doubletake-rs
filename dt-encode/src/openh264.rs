@@ -8,11 +8,12 @@
 //! all settable, which the NVENC path currently cannot do on driver 591.86.
 
 use openh264::encoder::{
-    BitRate, Complexity, Encoder, EncoderConfig, FrameRate, IntraFramePeriod, Level, Profile,
-    RateControlMode, UsageType, VuiConfig,
+    BitRate, Encoder, EncoderConfig, FrameRate, IntraFramePeriod, RateControlMode, VuiConfig,
 };
 use openh264::formats::{BgraSliceU8, YUVBuffer};
 use openh264::OpenH264API;
+
+pub use openh264::encoder::{Complexity, Level, Profile, UsageType};
 
 /// Configuration for [`OpenH264Encoder`].
 #[derive(Clone, Debug)]
@@ -150,6 +151,15 @@ impl OpenH264Encoder {
     /// Forces the next encoded frame to be an IDR (keyframe).
     pub fn force_keyframe(&mut self) {
         self.inner.force_intra_frame();
+    }
+
+    /// Encodes a pre-converted I420 frame (skips the BGRA conversion).
+    ///
+    /// Useful for benchmarking and for feeding frames that were converted on
+    /// another thread.
+    pub fn encode_yuv(&mut self, yuv: &YUVBuffer) -> Result<Vec<u8>, openh264::Error> {
+        let bitstream = self.inner.encode(yuv)?;
+        Ok(bitstream.to_vec())
     }
 }
 

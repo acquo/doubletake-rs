@@ -12,4 +12,7 @@ pub use nvenc::{
     NvEncoder, NvEncoderError, NV_ENC_BUFFER_FORMAT_ARGB, NV_ENC_DEVICE_TYPE_DIRECTX,
     NV_ENC_INPUT_RESOURCE_TYPE_DIRECTX, NV_ENC_PIC_FLAG_FORCEIDR, NV_ENC_PIC_STRUCT_FRAME,
 };
-pub use openh264::{annexb_nals, extract_sps_pps, strip_start_code, OpenH264Config, OpenH264Encoder};
+pub use openh264::{
+    annexb_nals, extract_sps_pps, strip_start_code, Complexity, Level, OpenH264Config,
+    OpenH264Encoder, Profile, UsageType,
+};
