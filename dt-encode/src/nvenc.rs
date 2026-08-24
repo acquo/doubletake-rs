@@ -22,6 +22,22 @@ pub const NV_ENC_DEVICE_TYPE_DIRECTX: u32 = 0x0;
 /// in the FFmpeg-reduced header; D3D11 resources register as DIRECTX).
 pub const NV_ENC_INPUT_RESOURCE_TYPE_DIRECTX: u32 = 0x0;
 
+// Clean aliases for the bindgen-mangled enum values used by the encoder.
+/// Constant bitrate rate control.
+pub const NV_ENC_PARAMS_RC_CBR: u32 = 0x2;
+/// Variable bitrate rate control.
+pub const NV_ENC_PARAMS_RC_VBR: u32 = 0x1;
+/// CABAC entropy coding for H.264.
+pub const NV_ENC_H264_ENTROPY_CODING_MODE_CABAC: u32 = 0x1;
+/// 32-bit BGRA (byte order) input, matches DXGI_FORMAT_B8G8R8A8_UNORM.
+pub const NV_ENC_BUFFER_FORMAT_ARGB: u32 = 0x0100_0000;
+/// Registering a resource for input images.
+pub const NV_ENC_INPUT_IMAGE: u32 = 0x0;
+/// Progressive frame picture structure.
+pub const NV_ENC_PIC_STRUCT_FRAME: u32 = 0x01;
+/// Force the next picture to be an IDR.
+pub const NV_ENC_PIC_FLAG_FORCEIDR: u32 = 0x2;
+
 /// NVENCAPI_STRUCT_VERSION(ver): version field layout for API structs.
 pub const fn nvencapi_struct_version(ver: u32) -> u32 {
     let api = nv::NVENCAPI_MAJOR_VERSION | (nv::NVENCAPI_MINOR_VERSION << 24);
@@ -67,6 +83,21 @@ impl NvEncoder {
                 return Err(NvEncoderError::Status(status as u32));
             }
             Ok(NvEncoder { _lib: lib, api: fn_list })
+        }
+    }
+
+    /// Queries the largest NvEncodeAPI version the driver supports
+    /// (lower 4 bits = minor, rest = major).
+    pub fn driver_max_version(&self) -> Result<u32, NvEncoderError> {
+        unsafe {
+            let get: Symbol<unsafe extern "C" fn(*mut u32) -> i32> =
+                self._lib.get(b"NvEncodeAPIGetMaxSupportedVersion")?;
+            let mut version: u32 = 0;
+            let status = get(&mut version);
+            if status != NV_ENC_SUCCESS {
+                return Err(NvEncoderError::Status(status as u32));
+            }
+            Ok(version)
         }
     }
 
@@ -163,6 +194,24 @@ impl NvEncoder {
             unsafe {
                 (self.api.nvEncDestroyEncoder.expect("nvEncDestroyEncoder"))(encoder);
             }
+        }
+    }
+
+    /// Returns the driver's last error string for `encoder` (debugging aid).
+    pub fn last_error_string(&self, encoder: *mut c_void) -> String {
+        let ptr = unsafe {
+            (self.api.nvEncGetLastErrorString.expect("nvEncGetLastErrorString"))(encoder)
+        };
+        if ptr.is_null() {
+            return String::new();
+        }
+        unsafe {
+            let mut len = 0usize;
+            while *ptr.add(len) != 0 {
+                len += 1;
+            }
+            let bytes = std::slice::from_raw_parts(ptr as *const u8, len);
+            String::from_utf8_lossy(bytes).to_string()
         }
     }
 }
