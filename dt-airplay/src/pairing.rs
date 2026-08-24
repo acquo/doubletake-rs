@@ -55,15 +55,15 @@ const SRP_N_HEX: &str = concat!(
     "43DB5BFCE0FD108E4B82D120A93AD2CAFFFFFFFFFFFFFFFF",
 );
 
-fn srp_n() -> BigUint {
+pub(crate) fn srp_n() -> BigUint {
     BigUint::parse_bytes(SRP_N_HEX.as_bytes(), 16).expect("valid SRP N")
 }
 
-fn srp_g() -> BigUint {
+pub(crate) fn srp_g() -> BigUint {
     BigUint::from(5u8)
 }
 
-fn sha512(data: &[u8]) -> [u8; 64] {
+pub(crate) fn sha512(data: &[u8]) -> [u8; 64] {
     let mut h = Sha512::new();
     h.update(data);
     h.finalize().into()
@@ -95,7 +95,7 @@ fn chacha_nonce(tag: &[u8; 8]) -> [u8; 12] {
 }
 
 /// SHA-512(salt || secret)[:16], used by the raw (AirMyPC) pair-verify.
-fn sha512_derive_key(salt: &[u8], secret: &[u8]) -> [u8; 16] {
+pub(crate) fn sha512_derive_key(salt: &[u8], secret: &[u8]) -> [u8; 16] {
     let mut h = Sha512::new();
     h.update(salt);
     h.update(secret);
@@ -113,12 +113,12 @@ fn clamp_scalar(mut b: [u8; 32]) -> [u8; 32] {
 }
 
 /// X25519 base-point multiplication (matches Go's `ScalarBaseMult`).
-fn x25519_base(secret: [u8; 32]) -> [u8; 32] {
+pub(crate) fn x25519_base(secret: [u8; 32]) -> [u8; 32] {
     MontgomeryPoint::mul_base_clamped(secret).to_bytes()
 }
 
 /// X25519 Diffie-Hellman shared secret (matches Go's `curve25519.X25519`).
-fn x25519_shared(secret: [u8; 32], their_public: [u8; 32]) -> [u8; 32] {
+pub(crate) fn x25519_shared(secret: [u8; 32], their_public: [u8; 32]) -> [u8; 32] {
     let scalar = Scalar::from_bytes_mod_order(clamp_scalar(secret));
     let point = MontgomeryPoint(their_public);
     (&scalar * &point).to_bytes()

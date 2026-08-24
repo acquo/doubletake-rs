@@ -22,6 +22,7 @@ pub mod mirror;
 pub mod mirror_cipher;
 pub mod pairing;
 pub mod plist_types;
+pub mod receiver;
 pub mod tlv8;
 pub mod transport;
 pub mod uuid;

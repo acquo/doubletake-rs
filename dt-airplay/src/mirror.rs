@@ -531,7 +531,7 @@ pub fn setup_mirror_session(
     d_int(&mut audio_stream_desc, "ct", 2); // ALAC
     d_int(&mut audio_stream_desc, "spf", 352);
     d_int(&mut audio_stream_desc, "sr", 44100);
-    d_int(&mut audio_stream_desc, "audioFormat", 0x40000); // ALAC audioFormat (matches upstream)
+    d_int(&mut audio_stream_desc, "audioFormat", 0); // Apple's Luna receiver reports audioFormat=0 for a working stream
     d_string(&mut audio_stream_desc, "audioMode", "default");
     d_bool(&mut audio_stream_desc, "usingScreen", true);
     d_int(&mut audio_stream_desc, "latencyMin", 0);
