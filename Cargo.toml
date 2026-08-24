@@ -2,6 +2,7 @@
 resolver = "2"
 members = [
     "dt-airplay",
+    "dt-encode",
 ]
 
 [workspace.package]
