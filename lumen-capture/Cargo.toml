@@ -1,0 +1,25 @@
+[package]
+name = "lumen-capture"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Screen capture for lumen (DXGI Desktop Duplication on Windows)"
+
+[dependencies]
+log = "0.4"
+thiserror = "1"
+windows = { version = "0.58", features = [
+    "Win32_Foundation",
+    "Win32_Graphics_Direct3D",
+    "Win32_Graphics_Direct3D11",
+    "Win32_Graphics_Dxgi",
+    "Win32_Graphics_Dxgi_Common",
+    "Win32_Graphics_Gdi",
+] }
+
+[dev-dependencies]
+ctrlc = "3"
+lumen-airplay = { path = "../lumen-airplay" }
+lumen-audio = { path = "../lumen-audio" }
+lumen-encode = { path = "../lumen-encode" }
+env_logger = "0.11"

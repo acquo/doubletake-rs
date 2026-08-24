@@ -1,10 +1,10 @@
 [workspace]
 resolver = "2"
 members = [
-    "dt-airplay",
-    "dt-audio",
-    "dt-capture",
-    "dt-encode",
+    "lumen-airplay",
+    "lumen-audio",
+    "lumen-capture",
+    "lumen-encode",
 ]
 
 [workspace.package]

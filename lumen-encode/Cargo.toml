@@ -1,0 +1,21 @@
+[package]
+name = "lumen-encode"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Video encoding pipeline for lumen (NVENC D3D11 zero-copy first)"
+
+[dependencies]
+libloading = "0.8"
+log = "0.4"
+openh264 = { version = "0.9.8", features = ["source"] }
+thiserror = "1"
+windows = { version = "0.58", features = [
+    "Win32_Foundation",
+    "Win32_Graphics_Direct3D",
+    "Win32_Graphics_Direct3D11",
+    "Win32_Graphics_Dxgi",
+] }
+
+[build-dependencies]
+bindgen = "0.70"
