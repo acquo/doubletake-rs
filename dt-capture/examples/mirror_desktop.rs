@@ -45,6 +45,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let host = args[1].clone();
     let port: u16 = args.get(2).and_then(|s| s.parse().ok()).unwrap_or(7000);
     let mut pin: Option<String> = None;
+    let mut pin_file: Option<String> = None;
     let mut force_pair = false;
     let mut bitrate_kbps: u32 = 8000;
     let mut latency_ms: u64 = 100;
@@ -93,6 +94,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             "--encoder" => {
                 i += 1;
                 encoder_kind = args[i].clone();
+            }
+            "--pin-file" => {
+                i += 1;
+                pin_file = Some(args[i].clone());
             }
             s if s.starts_with("--") => {
                 eprintln!("unknown option: {s}");
@@ -153,6 +158,24 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         match pairing.start_pin_display(&mut client) {
             Ok(()) => println!("pair-pin-start: OK — check the TV for the PIN"),
             Err(e) => println!("pair-pin-start: {e} (continuing)"),
+        }
+        if pin.is_none() {
+            // Optional: read the PIN from a file that an external process
+            // (e.g. adb screenshot + OCR) writes after pair-pin-start. This
+            // avoids the stdin dependency for automated pairing.
+            if let Some(path) = &pin_file {
+                println!("waiting for PIN in {path}…");
+                for _ in 0..600 {
+                    if let Ok(s) = std::fs::read_to_string(path) {
+                        let t = s.trim().to_string();
+                        if !t.is_empty() {
+                            pin = Some(t);
+                            break;
+                        }
+                    }
+                    std::thread::sleep(Duration::from_millis(100));
+                }
+            }
         }
         if pin.is_none() {
             print!("Enter the PIN shown on the receiver: ");
