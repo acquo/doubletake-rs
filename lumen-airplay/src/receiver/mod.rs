@@ -35,11 +35,16 @@ const BODY_LIMIT: usize = 8 << 20;
 
 // ---------- Feature / receiver profile constants (from receiver_server.go) ----------
 
-const FEATURE_SCREEN: u64 = 1 << 8;
-const FEATURE_AUDIO: u64 = 1 << 10;
 const FEATURE_FPSAP25: u64 = 1 << 14;
+#[allow(dead_code)]
+const FEATURE_SCREEN: u64 = 1 << 8;
+#[allow(dead_code)]
+const FEATURE_AUDIO: u64 = 1 << 10;
+#[allow(dead_code)]
 const FEATURE_HOMEKIT_PAIRING: u64 = 1 << 17;
+#[allow(dead_code)]
 const FEATURE_SYSTEM_PAIRING: u64 = 1 << 43;
+#[allow(dead_code)]
 const FEATURE_TRANSIENT_PAIRING: u64 = 1 << 48;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -98,14 +103,9 @@ fn profile_spec(profile: ReceiverProfile) -> ProfileSpec {
     match profile {
         ReceiverProfile::Modern => ProfileSpec {
             source_version: MODERN_AIRPLAY_SOURCE_VERSION.to_string(),
-            features: FEATURE_SCREEN
-                | FEATURE_AUDIO
-                | FEATURE_FPSAP25
-                | FEATURE_HOMEKIT_PAIRING
-                | (1 << 38)
-                | FEATURE_SYSTEM_PAIRING
-                | (1 << 46)
-                | FEATURE_TRANSIENT_PAIRING,
+            // Advertise the broad feature mask that Apple's own devices use, so
+            // macOS lists this receiver as a screen-mirroring target.
+            features: 0x4A7FCFD5_38174FDE,
             modern_setup: true,
         },
         ReceiverProfile::Roku => ProfileSpec {
@@ -219,6 +219,23 @@ impl ReceiverServer {
         sd.register(instance)
             .map_err(|e| std::io::Error::other(format!("register airplay: {e}")))?;
         log::info!("[receiver] advertising _airplay._tcp {}:{} name={} features=0x{:x}", ip, port, self.cfg.name, features);
+
+        // macOS 13+ (Ventura) also requires `_raop._tcp` to list a device as a
+        // screen-mirroring target, so advertise the audio-side service too.
+        let raop_txt = txt_for_raop(&self.cfg.device_id, &self.cfg.model, &self.verifying_key);
+        let raop_type = "_raop._tcp.local.";
+        let raop_instance = ServiceInfo::new(
+            raop_type,
+            &self.cfg.name,
+            host,
+            ip,
+            port,
+            Some(raop_txt),
+        )
+        .map_err(|e| std::io::Error::other(format!("raop ServiceInfo: {e}")))?;
+        sd.register(raop_instance)
+            .map_err(|e| std::io::Error::other(format!("register raop: {e}")))?;
+
         Ok(sd)
     }
 
@@ -456,11 +473,12 @@ fn txt_for_airplay(
     name: &str,
     source_version: &str,
 ) -> HashMap<String, String> {
-    use base64::Engine;
     let lo = features as u32;
     let hi = (features >> 32) as u32;
     let features_str = format!("0x{hi:08x},0x{lo:08x}");
-    let pk = base64::engine::general_purpose::STANDARD.encode(verifying.as_bytes());
+    // Apple's `_airplay._tcp` `pk` TXT is the hex-encoded Ed25519 public key
+    // (64 hex chars), NOT base64 — the MacBook filters devices with a bad pk.
+    let pk = hex::encode(verifying.as_bytes());
     let mut t = HashMap::new();
     t.insert("deviceid".to_string(), device_id.to_string());
     t.insert("features".to_string(), features_str);
@@ -476,6 +494,33 @@ fn txt_for_airplay(
     t.insert("cn".to_string(), model.to_string());
     // name often advertised as instance; include as a spare key too.
     t.insert("n".to_string(), name.to_string());
+    t
+}
+
+/// `_raop._tcp` TXT records for the AirPlay audio-side discovery, which
+/// macOS 13+ also consults when listing screen-mirroring targets.
+fn txt_for_raop(
+    device_id: &str,
+    model: &str,
+    verifying: &VerifyingKey,
+) -> HashMap<String, String> {
+    let mut t = HashMap::new();
+    t.insert("am".into(), model.into());
+    t.insert("md".into(), "0,1,2".into());
+    t.insert("deviceid".into(), device_id.into());
+    t.insert("features".into(), "0x00000000,0x00000500".into());
+    t.insert("flags".into(), "0x4".into());
+    t.insert("model".into(), model.into());
+    t.insert("tp".into(), "UDP".into());
+    t.insert("pk".into(), hex::encode(verifying.as_bytes()));
+    t.insert("vv".into(), "2".into());
+    t.insert("ch".into(), "2".into());
+    t.insert("cn".into(), "0,1,2,3".into());
+    t.insert("et".into(), "0,1,3,4".into());
+    t.insert("sf".into(), "0x4".into());
+    t.insert("sr".into(), "44100".into());
+    t.insert("ss".into(), "16".into());
+    t.insert("v".into(), "1".into());
     t
 }
 
