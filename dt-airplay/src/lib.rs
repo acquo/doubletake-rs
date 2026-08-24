@@ -5,6 +5,7 @@
 
 pub mod digest;
 pub mod plist_types;
+pub mod tlv8;
 
 #[cfg(test)]
 mod tests {
