@@ -437,6 +437,16 @@ fn requested_setup_stream_types(body: &[u8]) -> Vec<i64> {
     types
 }
 
+/// Short hex preview of a byte slice for diagnostics.
+fn hex_preview(bytes: &[u8]) -> String {
+    let n = bytes.len().min(48);
+    bytes[..n]
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
 /// Compact text summary of a plist for diagnostics.
 fn summarize_plist(v: &Value) -> String {
     if let Some(d) = v.as_dictionary() {
@@ -584,7 +594,7 @@ struct ReceiverSession {
 
 fn serve_control(s: &ReceiverServer, conn: TcpStream) -> std::io::Result<()> {
     let _ = conn.set_read_timeout(Some(Duration::from_secs(120)));
-    let pairing = ReceiverPairing::new(&s.identifier, s.signing_key.clone(), &s.cfg.code);
+    let pairing = ReceiverPairing::new(&s.identifier, "Pair-Setup", s.signing_key.clone(), &s.cfg.code);
     let fairplay = if s.profile.features & FEATURE_FPSAP25 != 0 {
         Some(ReceiverFpsap::new())
     } else {
@@ -610,11 +620,12 @@ fn serve_control(s: &ReceiverServer, conn: TcpStream) -> std::io::Result<()> {
             log::info!("[receiver] control encryption enabled for {}", req.uri);
         }
         log::info!(
-            "[receiver] {} {} -> {} (body={} enc={})",
+            "[receiver] {} {} -> {} (req={} resp={} enc={})",
             req.method,
             req.uri,
             resp.status,
             req.body.len(),
+            resp.body.len(),
             *s.hap_enabled.lock().unwrap()
         );
     }
@@ -703,13 +714,15 @@ fn dispatch(
             (Response::empty(200), None)
         }
         ("POST", "/pair-setup") => {
-            log::info!("[receiver] pair-setup ({} bytes)", req.body.len());
+            log::info!("[receiver] pair-setup req: {}", hex_preview(&req.body));
             let body = session.pairing.pair_setup(&req.body);
+            log::info!("[receiver] pair-setup resp: {}", hex_preview(&body));
             (Response::ok(body, "application/octet-stream"), None)
         }
         ("POST", "/pair-verify") => {
-            log::info!("[receiver] pair-verify ({} bytes)", req.body.len());
+            log::info!("[receiver] pair-verify req: {}", hex_preview(&req.body));
             let (body, keys) = session.pairing.pair_verify(&req.body);
+            log::info!("[receiver] pair-verify resp: {}", hex_preview(&body));
             (Response::ok(body, "application/octet-stream"), keys)
         }
         ("POST", "/fp-setup") => {

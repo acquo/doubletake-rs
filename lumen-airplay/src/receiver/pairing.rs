@@ -58,6 +58,9 @@ pub struct ReceiverPairing {
     identifier: Vec<u8>,
     signing_key: SigningKey,
     verifying_key: VerifyingKey,
+    /// SRP "username": the receiver's deviceID, which Apple clients use as the
+    /// SRP username (not the literal "Pair-Setup").
+    username: String,
     pin: String,
     controllers: HashMap<String, Vec<u8>>,
     transient: HashMap<String, Vec<u8>>,
@@ -68,12 +71,13 @@ pub struct ReceiverPairing {
 }
 
 impl ReceiverPairing {
-    pub fn new(identifier: &str, signing_key: SigningKey, pin: &str) -> Self {
+    pub fn new(identifier: &str, username: &str, signing_key: SigningKey, pin: &str) -> Self {
         let verifying_key = signing_key.verifying_key();
         ReceiverPairing {
             identifier: identifier.as_bytes().to_vec(),
             signing_key,
             verifying_key,
+            username: username.to_string(),
             pin: pin.to_string(),
             controllers: HashMap::new(),
             transient: HashMap::new(),
@@ -128,8 +132,10 @@ impl ReceiverPairing {
     }
 
     fn begin_srp_setup(&mut self, msg: &HashMap<u8, Vec<u8>>) -> Vec<u8> {
+        // Accept the SRP setup methods Apple clients send: 0 = with PIN, 1 =
+        // "PairSetupWithPK" (no PIN), 3 = legacy no-PIN. Only reject bad ones.
         if let Some(m) = msg.get(&TLV_METHOD) {
-            if m.len() != 1 || m[0] != 0 {
+            if m.len() != 1 || !matches!(m[0], 0 | 1 | 3) {
                 return tlv_err(2);
             }
         } else {
@@ -137,7 +143,14 @@ impl ReceiverPairing {
         }
         let mut transient = false;
         if let Some(flags) = msg.get(&TLV_FLAGS) {
-            if flags.len() != 4 || u32::from_le_bytes(flags[..4].try_into().unwrap()) != PAIR_FLAG_TRANSIENT {
+            // Apple sends flags as a varying-width integer; accept 1 or 4 bytes
+            // and detect the transient (no-PIN) pairing bit.
+            let is_transient = match flags.len() {
+                1 => flags[0] & PAIR_FLAG_TRANSIENT as u8 != 0,
+                4 => u32::from_le_bytes(flags[..4].try_into().unwrap()) & PAIR_FLAG_TRANSIENT != 0,
+                _ => return tlv_err(2),
+            };
+            if !is_transient {
                 return tlv_err(2);
             }
             transient = true;
@@ -153,7 +166,7 @@ impl ReceiverPairing {
         OsRng.fill_bytes(&mut b);
 
         let pin = if transient { "" } else { self.pin.as_str() };
-        let x = bigint(&srp_x(&salt, pin));
+        let x = bigint(&srp_x(&salt, &self.username, pin));
         let n = srp_n();
         let g = srp_g();
         let v = g.modpow(&x, &n);
@@ -210,6 +223,8 @@ impl ReceiverPairing {
         let shared = base.modpow(&bigint(&b), &n);
         let shared_key: Vec<u8> = sha512(&shared.to_bytes_be()).to_vec();
         let want = srp_client_proof(&salt, &cp_int, &s_pub_int, &shared_key);
+        log::debug!("[pair] SRP M3 salt={} client_pub={:x?} server_pub={:x?}", hex(&salt), &client_pub[..8], &server_pub[..8]);
+        log::debug!("[pair] SRP M3 want={} got={}", hex(&want), hex(&client_proof));
         if want != client_proof {
             self.setup = None;
             return tlv_err(4);
@@ -584,8 +599,7 @@ fn nonce(label: &str) -> [u8; 12] {
     n
 }
 
-fn tlv_err(state: u8) -> Vec<u8> {
-    tlv::encode_ordered(&[
+fn tlv_err(state: u8) -> Vec<u8> {    tlv::encode_ordered(&[
         Tlv8Item::new(TLV_STATE, vec![state]),
         Tlv8Item::new(TLV_ERROR, vec![AUTH_ERROR]),
     ])
@@ -595,8 +609,12 @@ fn bigint(b: &[u8]) -> num_bigint::BigUint {
     num_bigint::BigUint::from_bytes_be(b)
 }
 
-fn srp_x(salt: &[u8], pin: &str) -> Vec<u8> {
-    let inner = sha512(format!("Pair-Setup:{pin}").as_bytes());
+fn hex(b: &[u8]) -> String {
+    b.iter().map(|x| format!("{x:02x}")).collect::<Vec<_>>().join("")
+}
+
+fn srp_x(salt: &[u8], username: &str, pin: &str) -> Vec<u8> {
+    let inner = sha512(format!("{username}:{pin}").as_bytes());
     sha512(&[salt.to_vec(), inner.to_vec()].concat()).to_vec()
 }
 
