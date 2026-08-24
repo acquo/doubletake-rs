@@ -6,6 +6,8 @@
 //! network clock so the receiver can sync audio with video.
 
 use crate::error::{Error, Result};
+use chacha20poly1305::aead::{Aead, KeyInit, Payload};
+use chacha20poly1305::{ChaCha20Poly1305, Key, Nonce};
 use std::io::Error as IoError;
 use std::net::{SocketAddr, UdpSocket};
 
@@ -120,10 +122,17 @@ pub struct AudioStream {
     latency_samples: u32,
     /// Current RTP timestamp (44.1 kHz clock).
     pub rtp_time: u32,
+    /// ChaCha20-Poly1305 key when the session is HAP-encrypted (modern Apple
+    /// audio crypto); the receiver uses the `shk` published in SETUP to
+    /// decrypt. `None` = plaintext.
+    chacha_key: Option<[u8; 32]>,
+    /// ChaCha nonce counter (increments once per frame).
+    chacha_counter: u64,
 }
 
 impl AudioStream {
     /// Creates the audio stream state bound to the local data/control sockets.
+    /// `chacha_key` enables ChaCha20-Poly1305 audio encryption.
     pub fn new(
         host: &str,
         data_port: u16,
@@ -131,6 +140,7 @@ impl AudioStream {
         data_socket: UdpSocket,
         ctrl_socket: UdpSocket,
         latency_samples: u32,
+        chacha_key: Option<Vec<u8>>,
     ) -> Result<Self> {
         let remote_data = format!("{host}:{data_port}")
             .parse()
@@ -138,6 +148,14 @@ impl AudioStream {
         let remote_ctrl = format!("{host}:{ctrl_port}")
             .parse()
             .map_err(|e| Error::Protocol(format!("invalid audio ctrl addr: {e}")))?;
+        let chacha_key = match chacha_key {
+            Some(k) if k.len() == 32 => {
+                let mut arr = [0u8; 32];
+                arr.copy_from_slice(&k);
+                Some(arr)
+            }
+            _ => None,
+        };
         Ok(AudioStream {
             data_socket,
             ctrl_socket,
@@ -145,19 +163,52 @@ impl AudioStream {
             remote_ctrl,
             latency_samples,
             rtp_time: 0,
+            chacha_key,
+            chacha_counter: 0,
         })
     }
 
-    /// Sends one RTP audio packet: 12-byte header (PT=96, SSRC=0) + the raw
-    /// ALAC frame payload.
+    /// Whether this stream uses ChaCha encryption (encrypted sessions send
+    /// each frame once, without FEC).
+    pub fn is_encrypted(&self) -> bool {
+        self.chacha_key.is_some()
+    }
+
+    /// Sends one RTP audio packet: 12-byte header (PT=96, SSRC=0) + payload.
+    /// With ChaCha encryption, the ALAC payload is sealed (AAD = header[4..12],
+    /// counter nonce) and the nonce counter is appended — the receiver
+    /// decrypts with the `shk` from SETUP.
     pub fn send_frame(&mut self, payload: &[u8], rtp_time: u32, seq: u16) -> Result<()> {
-        let mut pkt = Vec::with_capacity(12 + payload.len());
+        let mut pkt = Vec::with_capacity(12 + payload.len() + 24);
         pkt.push(0x80);
         pkt.push(RTP_PAYLOAD_TYPE);
         pkt.extend_from_slice(&seq.to_be_bytes());
         pkt.extend_from_slice(&rtp_time.to_be_bytes());
         pkt.extend_from_slice(&0u32.to_be_bytes()); // SSRC = 0 (Apple mirroring)
-        pkt.extend_from_slice(payload);
+
+        let mut body = payload.to_vec();
+        if let Some(key) = &self.chacha_key {
+            // AAD = the RTP header without V/PT (timestamp + SSRC).
+            let aad = &pkt[4..12];
+            let cipher = ChaCha20Poly1305::new(Key::from_slice(key));
+            let mut nonce = [0u8; 12];
+            nonce[..8].copy_from_slice(&self.chacha_counter.to_le_bytes());
+            let sealed = cipher
+                .encrypt(
+                    Nonce::from_slice(&nonce),
+                    Payload {
+                        msg: &body,
+                        aad,
+                    },
+                )
+                .map_err(|e| Error::Crypto(format!("audio chacha seal: {e}")))?;
+            body = sealed;
+            // Receiver reads the nonce counter from the packet tail.
+            body.extend_from_slice(&self.chacha_counter.to_le_bytes());
+            self.chacha_counter += 1;
+        }
+
+        pkt.extend_from_slice(&body);
         self.data_socket
             .send_to(&pkt, self.remote_data)
             .map_err(|e| Error::from_io("audio rtp send", e))?;
@@ -258,6 +309,7 @@ mod tests {
             data,
             ctrl,
             100,
+            None,
         )
         .unwrap();
         as_.set_ctrl_nonblocking().unwrap();

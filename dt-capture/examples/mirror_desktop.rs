@@ -461,8 +461,9 @@ fn run_audio(
     audio.send_sync_packet(net_time, true)?;
     println!("audio started (rtp epoch {rtp_time})");
 
-    // FEC: burst the first 8 frames, then interleave a retransmit before each
-    // new frame (port of upstream's burst-8 + retransmit).
+    // Encrypted (ChaCha) sessions send each frame once (no FEC); plaintext
+    // sessions use upstream's burst-8 + interleaved retransmit.
+    let use_fec = !audio.is_encrypted();
     const DEPTH: usize = 8;
     let mut retransmit: Vec<Option<(Vec<u8>, u32, u16)>> = vec![None; DEPTH];
     let mut idx = 0usize;
@@ -484,22 +485,26 @@ fn run_audio(
         };
         let payload = dt_airplay::audio::encode_alac_verbatim(&pcm, dt_airplay::audio::SPF as usize, 2);
 
-        if !burst_done {
-            audio.send_frame(&payload, rtp_time, seq)?;
-            retransmit[idx] = Some((payload, rtp_time, seq));
-            idx += 1;
-            if idx >= DEPTH {
-                burst_done = true;
-                idx = 0;
+        if use_fec {
+            if !burst_done {
+                audio.send_frame(&payload, rtp_time, seq)?;
+                retransmit[idx] = Some((payload, rtp_time, seq));
+                idx += 1;
+                if idx >= DEPTH {
+                    burst_done = true;
+                    idx = 0;
+                }
+            } else {
+                if let Some((old, old_rtp, old_seq)) = retransmit[idx].take() {
+                    audio.send_frame(&old, old_rtp, old_seq)?;
+                    retransmit[idx] = Some((old, old_rtp, old_seq));
+                }
+                audio.send_frame(&payload, rtp_time, seq)?;
+                retransmit[idx] = Some((payload, rtp_time, seq));
+                idx = (idx + 1) % DEPTH;
             }
         } else {
-            if let Some((old, old_rtp, old_seq)) = retransmit[idx].take() {
-                audio.send_frame(&old, old_rtp, old_seq)?;
-                retransmit[idx] = Some((old, old_rtp, old_seq));
-            }
             audio.send_frame(&payload, rtp_time, seq)?;
-            retransmit[idx] = Some((payload, rtp_time, seq));
-            idx = (idx + 1) % DEPTH;
         }
 
         seq = seq.wrapping_add(1);

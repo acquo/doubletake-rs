@@ -355,6 +355,10 @@ pub struct MirrorSession {
     pub audio_ctrl_port: u16,
     /// Negotiated audio latency in 44.1 kHz samples.
     pub audio_latency_samples: u32,
+    /// Whether audio is ChaCha20-Poly1305 encrypted (HAP-encrypted sessions).
+    pub audio_chacha: bool,
+    /// Per-session 32-byte audio encryption key (published as `shk`).
+    pub audio_chacha_key: Vec<u8>,
 }
 
 /// Negotiates a mirroring session with the receiver.
@@ -532,10 +536,33 @@ pub fn setup_mirror_session(
     d_bool(&mut audio_stream_desc, "usingScreen", true);
     d_int(&mut audio_stream_desc, "latencyMin", 0);
     d_int(&mut audio_stream_desc, "latencyMax", audio_latency_samples as i64);
-    d_int(&mut audio_stream_desc, "controlPort", audio_ctrl_port as i64);
-    // This session always sends plaintext audio (no ChaCha path), so FEC is
-    // used; advertise it like upstream does for legacy sessions.
-    d_int(&mut audio_stream_desc, "redundantAudio", 2);
+
+    // Audio stream encryption: HAP-encrypted sessions use ChaCha20-Poly1305
+    // with a per-session key published in `shk` (modern Apple audio crypto);
+    // unencrypted sessions send plaintext + FEC. The TV's Luna receiver
+    // decrypts with `shk`, so plaintext audio is decoded as silence.
+    let audio_chacha = client.is_encrypted();
+    let mut audio_chacha_key = [0u8; 32];
+    if audio_chacha {
+        rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut audio_chacha_key);
+    }
+    if audio_chacha {
+        d_data(&mut audio_stream_desc, "shk", &audio_chacha_key);
+        d_bool(&mut audio_stream_desc, "isMedia", false);
+        d_bool(&mut audio_stream_desc, "supportsDynamicStreamID", true);
+        let mut rtp = plist_dict();
+        d_bool(&mut rtp, "streamConnectionKeyUseStreamEncryptionKey", true);
+        let mut rtcp = plist_dict();
+        d_int(&mut rtcp, "streamConnectionKeyPort", audio_ctrl_port as i64);
+        let mut conns = plist_dict();
+        d_insert(&mut conns, "streamConnectionTypeRTP", rtp);
+        d_insert(&mut conns, "streamConnectionTypeRTCP", rtcp);
+        d_insert(&mut audio_stream_desc, "streamConnections", conns);
+    } else {
+        d_int(&mut audio_stream_desc, "controlPort", audio_ctrl_port as i64);
+        // Plaintext sessions use FEC; advertise like upstream.
+        d_int(&mut audio_stream_desc, "redundantAudio", 2);
+    }
 
     let audio_setup_plist = if modern_control_setup {
         stream_only_plist(&audio_stream_desc)
@@ -737,6 +764,8 @@ pub fn setup_mirror_session(
         audio_data_port,
         audio_ctrl_port: audio_ctrl_port_remote,
         audio_latency_samples,
+        audio_chacha,
+        audio_chacha_key: audio_chacha_key.to_vec(),
     })
 }
 
@@ -796,6 +825,11 @@ impl MirrorSession {
             data_clone,
             ctrl_clone,
             self.audio_latency_samples,
+            if self.audio_chacha {
+                Some(self.audio_chacha_key.clone())
+            } else {
+                None
+            },
         )?))
     }
 
