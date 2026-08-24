@@ -1,7 +1,10 @@
 //! DXGI Desktop Duplication capture.
 //!
-//! Produces `ID3D11Texture2D` surfaces that can be registered with NVENC
-//! directly (zero-copy, no CPU readback).
+//! Two consumers:
+//! - [`DesktopDuplicator::acquire_frame`]: `ID3D11Texture2D` surfaces, for the
+//!   NVENC zero-copy path (no CPU readback).
+//! - [`DesktopDuplicator::acquire_frame_cpu`]: tightly-packed BGRA8 frames
+//!   read back to the CPU, for software encoders (e.g. OpenH264).
 
 use windows::core::{Interface, Result as WinResult};
 use windows::Win32::Foundation::RECT;
@@ -9,8 +12,12 @@ use windows::Win32::Graphics::Direct3D::{
     D3D_DRIVER_TYPE_HARDWARE, D3D_FEATURE_LEVEL_10_0, D3D_FEATURE_LEVEL_11_0,
 };
 use windows::Win32::Graphics::Direct3D11::{
-    D3D11CreateDevice, D3D11_CREATE_DEVICE_FLAG, D3D11_SDK_VERSION, ID3D11Device,
-    ID3D11DeviceContext, ID3D11Texture2D,
+    D3D11CreateDevice, D3D11_CPU_ACCESS_READ, D3D11_CREATE_DEVICE_FLAG, D3D11_MAP_READ,
+    D3D11_MAPPED_SUBRESOURCE, D3D11_SDK_VERSION, D3D11_TEXTURE2D_DESC, D3D11_USAGE_STAGING,
+    ID3D11Device, ID3D11DeviceContext, ID3D11Resource, ID3D11Texture2D,
+};
+use windows::Win32::Graphics::Dxgi::Common::{
+    DXGI_FORMAT, DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_SAMPLE_DESC,
 };
 use windows::Win32::Graphics::Dxgi::{
     IDXGIAdapter, IDXGIDevice, IDXGIOutput, IDXGIOutput1, IDXGIOutputDuplication, IDXGIResource,
@@ -26,13 +33,28 @@ pub enum DxgiError {
     AccessLost,
     #[error("no output at index {0}")]
     NoOutput(u32),
+    #[error("unsupported surface format {0:?} for CPU readback (only B8G8R8A8_UNORM)")]
+    UnsupportedFormat(DXGI_FORMAT),
+}
+
+/// A desktop frame read back to the CPU.
+#[derive(Debug)]
+pub struct CpuFrame {
+    /// Tightly packed `[B,G,R,A]` pixels, `width * 4` bytes per row.
+    pub bgra: Vec<u8>,
+    pub width: u32,
+    pub height: u32,
+    /// Source surface format (always `B8G8R8A8_UNORM` today).
+    pub format: DXGI_FORMAT,
 }
 
 /// Captures the desktop via DXGI Desktop Duplication.
 pub struct DesktopDuplicator {
     device: ID3D11Device,
-    _context: ID3D11DeviceContext,
+    context: ID3D11DeviceContext,
     duplication: IDXGIOutputDuplication,
+    /// Lazily-created staging texture for CPU readback.
+    staging: Option<ID3D11Texture2D>,
     pub width: u32,
     pub height: u32,
 }
@@ -72,8 +94,9 @@ impl DesktopDuplicator {
 
         Ok(DesktopDuplicator {
             device,
-            _context: context,
+            context,
             duplication,
+            staging: None,
             width,
             height,
         })
@@ -107,6 +130,86 @@ impl DesktopDuplicator {
         unsafe {
             let _ = self.duplication.ReleaseFrame();
         }
+    }
+
+    /// Waits up to `timeout_ms` for a new desktop frame, read back to the CPU
+    /// as tightly-packed BGRA8 (for software encoders).
+    ///
+    /// `Ok(None)` means the timeout elapsed without a new frame.
+    pub fn acquire_frame_cpu(&mut self, timeout_ms: u32) -> Result<Option<CpuFrame>, DxgiError> {
+        let Some(texture) = self.acquire_frame(timeout_ms)? else {
+            return Ok(None);
+        };
+        let result = self.readback_cpu(&texture);
+        self.release_frame();
+        result.map(Some)
+    }
+
+    /// Copies `texture` into a staging texture and reads the pixels back.
+    fn readback_cpu(&mut self, texture: &ID3D11Texture2D) -> Result<CpuFrame, DxgiError> {
+        let mut desc = D3D11_TEXTURE2D_DESC::default();
+        unsafe { texture.GetDesc(&mut desc) };
+        if desc.Format != DXGI_FORMAT_B8G8R8A8_UNORM {
+            return Err(DxgiError::UnsupportedFormat(desc.Format));
+        }
+
+        // (Re)create the staging texture when the surface size/format changed.
+        let need_create = match &self.staging {
+            Some(s) => {
+                let mut sd = D3D11_TEXTURE2D_DESC::default();
+                unsafe { s.GetDesc(&mut sd) };
+                sd.Width != desc.Width || sd.Height != desc.Height || sd.Format != desc.Format
+            }
+            None => true,
+        };
+        if need_create {
+            let staging_desc = D3D11_TEXTURE2D_DESC {
+                Width: desc.Width,
+                Height: desc.Height,
+                MipLevels: 1,
+                ArraySize: 1,
+                Format: desc.Format,
+                SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+                Usage: D3D11_USAGE_STAGING,
+                BindFlags: 0,
+                CPUAccessFlags: D3D11_CPU_ACCESS_READ.0 as u32,
+                MiscFlags: 0,
+            };
+            let mut staging: Option<ID3D11Texture2D> = None;
+            unsafe { self.device.CreateTexture2D(&staging_desc, None, Some(&mut staging))? };
+            self.staging = staging;
+        }
+        let staging = self.staging.as_ref().expect("staging created above");
+
+        unsafe {
+            let src: ID3D11Resource = texture.cast()?;
+            let dst: ID3D11Resource = staging.cast()?;
+            self.context.CopyResource(&dst, &src);
+        }
+
+        let mut mapped = D3D11_MAPPED_SUBRESOURCE::default();
+        unsafe { self.context.Map(staging, 0, D3D11_MAP_READ, 0, Some(&mut mapped))? };
+        let row_pitch = mapped.RowPitch as usize;
+        let width = desc.Width as usize;
+        let height = desc.Height as usize;
+        let bytes = unsafe {
+            std::slice::from_raw_parts(mapped.pData as *const u8, row_pitch * height)
+        };
+        let mut bgra = vec![0u8; width * 4 * height];
+        for y in 0..height {
+            let src = &bytes[y * row_pitch..y * row_pitch + width * 4];
+            bgra[y * width * 4..(y + 1) * width * 4].copy_from_slice(src);
+        }
+        unsafe {
+            self.context.Unmap(staging, 0);
+        }
+
+        Ok(CpuFrame {
+            bgra,
+            width: desc.Width,
+            height: desc.Height,
+            format: desc.Format,
+        })
     }
 
     /// Helper: extracts the desktop bounds rect (kept for diagnostics).

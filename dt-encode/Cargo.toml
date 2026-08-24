@@ -8,6 +8,7 @@ description = "Video encoding pipeline for doubletake-rs (NVENC D3D11 zero-copy 
 [dependencies]
 libloading = "0.8"
 log = "0.4"
+openh264 = { version = "0.9.8", features = ["source"] }
 thiserror = "1"
 windows = { version = "0.58", features = [
     "Win32_Foundation",
