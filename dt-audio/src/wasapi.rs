@@ -47,11 +47,15 @@ pub struct LoopbackCapture {
 }
 
 impl LoopbackCapture {
-    /// Receives one frame of `FRAME_SAMPLES * CHANNELS` interleaved i16.
+    /// Receives one frame of `FRAME_SAMPLES * CHANNELS` interleaved i16
+    /// (blocking).
     pub fn recv_frame(&self) -> Result<Vec<i16>, AudioError> {
-        self.rx
-            .recv()
-            .map_err(|_| AudioError::ThreadGone)
+        self.rx.recv().map_err(|_| AudioError::ThreadGone)
+    }
+
+    /// Receives one frame if immediately available (non-blocking).
+    pub fn try_recv_frame(&self) -> Option<Vec<i16>> {
+        self.rx.try_recv().ok()
     }
 }
 

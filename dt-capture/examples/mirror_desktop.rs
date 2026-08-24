@@ -51,6 +51,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut creds_path = CredentialStore::default_path();
     let mut no_encrypt = false;
     let mut no_audio = false;
+    let mut volume_db: Option<f64> = None;
     let mut i = 3;
     while i < args.len() {
         match args[i].as_str() {
@@ -69,6 +70,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
             "--no-encrypt" => no_encrypt = true,
             "--no-audio" => no_audio = true,
+            "--volume-db" => {
+                i += 1;
+                volume_db = Some(args[i].parse()?);
+            }
             s if s.starts_with("--") => {
                 eprintln!("unknown option: {s}");
                 std::process::exit(2);
@@ -172,6 +177,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         session.session_uri
     );
     session.send_feedback()?;
+    if let Some(db) = volume_db {
+        session.set_volume_db(db)?;
+        println!("receiver volume set to {db} dB");
+    }
 
     // 5. Capture + encode + stream until Ctrl+C.
     let mut dup = DesktopDuplicator::new(0)?;
@@ -303,6 +312,17 @@ fn run_audio(
     }
     if stop.load(Ordering::Relaxed) {
         return Ok(());
+    }
+    // Capture started before video did, so the channel holds a backlog of
+    // audio accumulated while we waited for the first video frame. Drop it so
+    // we begin streaming from the freshest sample and audio lines up with
+    // video (port of upstream DrainStale).
+    let mut drained = 0u64;
+    while let Some(_) = capture.try_recv_frame() {
+        drained += 1;
+    }
+    if drained > 0 {
+        println!("audio: drained {drained} stale frames (~{}ms)", drained * 8);
     }
     let _ = audio.set_ctrl_nonblocking();
 

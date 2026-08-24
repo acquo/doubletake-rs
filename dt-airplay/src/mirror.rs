@@ -533,6 +533,9 @@ pub fn setup_mirror_session(
     d_int(&mut audio_stream_desc, "latencyMin", 0);
     d_int(&mut audio_stream_desc, "latencyMax", audio_latency_samples as i64);
     d_int(&mut audio_stream_desc, "controlPort", audio_ctrl_port as i64);
+    // This session always sends plaintext audio (no ChaCha path), so FEC is
+    // used; advertise it like upstream does for legacy sessions.
+    d_int(&mut audio_stream_desc, "redundantAudio", 2);
 
     let audio_setup_plist = if modern_control_setup {
         stream_only_plist(&audio_stream_desc)
@@ -685,10 +688,9 @@ pub fn setup_mirror_session(
         }
     }
 
-    // Volume 0 dB, sent twice like real senders.
-    let volume_body = b"volume: 0.000000\r\n";
-    let _ = client.rtsp_request("SET_PARAMETER", &audio_uri, "text/parameters", volume_body, &std::collections::HashMap::new());
-    let _ = client.rtsp_request("SET_PARAMETER", &audio_uri, "text/parameters", volume_body, &std::collections::HashMap::new());
+    // NOTE: no volume SET_PARAMETER here. 0 dB (full scale) would crank the
+    // receiver's own volume to 100% on every connect; callers may send a
+    // volume explicitly via `MirrorSession::set_volume_db`.
 
     // Stream cipher.
     let (stream_cipher, chacha_cipher) = if !enc_key.is_empty()
@@ -795,6 +797,29 @@ impl MirrorSession {
             ctrl_clone,
             self.audio_latency_samples,
         )?))
+    }
+
+    /// Sets the receiver volume in dB (0 = full scale / 100% on most
+    /// receivers; negative values attenuate). Sent twice like real senders.
+    /// Callers should only use this when the user explicitly asked for a
+    /// volume; the session no longer touches the receiver's volume by default.
+    pub fn set_volume_db(&mut self, db: f64) -> Result<()> {
+        let body = format!("volume: {db:.6}\r\n");
+        let _ = self.client.rtsp_request(
+            "SET_PARAMETER",
+            &self.session_uri,
+            "text/parameters",
+            body.as_bytes(),
+            &std::collections::HashMap::new(),
+        );
+        let _ = self.client.rtsp_request(
+            "SET_PARAMETER",
+            &self.session_uri,
+            "text/parameters",
+            body.as_bytes(),
+            &std::collections::HashMap::new(),
+        );
+        Ok(())
     }
 
     /// One atomic timestamp/timeline pair for a VCL header.
