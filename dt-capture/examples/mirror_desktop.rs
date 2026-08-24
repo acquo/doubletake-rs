@@ -53,6 +53,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut no_audio = false;
     let mut volume_db: Option<f64> = None;
     let mut seconds: u64 = 0; // 0 = run until Ctrl+C
+    let mut fps: u32 = 30;
+    let mut threads: u16 = 8;
     let mut i = 3;
     while i < args.len() {
         match args[i].as_str() {
@@ -78,6 +80,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             "--seconds" => {
                 i += 1;
                 seconds = args[i].parse()?;
+            }
+            "--fps" => {
+                i += 1;
+                fps = args[i].parse()?;
+            }
+            "--threads" => {
+                i += 1;
+                threads = args[i].parse()?;
             }
             s if s.starts_with("--") => {
                 eprintln!("unknown option: {s}");
@@ -192,10 +202,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("desktop: {}x{} (duplication ready)", dup.width, dup.height);
     let mut encoder = OpenH264Encoder::new(OpenH264Config {
         bitrate_bps: bitrate_kbps * 1000,
-        fps: 30.0,
+        fps: fps as f32,
+        threads, // explicit threads beat auto on complex content (32 -> 64 fps)
+        skip_frames: true, // let the rate controller bound frame sizes
         ..Default::default()
     })?;
-    println!("OpenH264 encoder ready ({bitrate_kbps} kbps, 30 fps)");
+    println!("OpenH264 encoder ready ({bitrate_kbps} kbps, {fps} fps, {threads} threads)");
 
     let stop = Arc::new(AtomicBool::new(false));
     let stop2 = stop.clone();
@@ -246,20 +258,42 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut idle_flushed = false;
     let start = Instant::now();
 
+    // Frame pacing: encode at most `fps` frames/second. Bursty desktop updates
+    // (e.g. a video playing) are throttled so encode work stays bounded.
+    let frame_period = Duration::from_micros(1_000_000 / fps.max(1) as u64);
+    let mut last_send = Instant::now() - frame_period;
+    let mut stats = StageStats::default();
+
     while !stop.load(Ordering::Relaxed) && (seconds == 0 || start.elapsed().as_secs() < seconds) {
-        match dup.acquire_frame_cpu(1000)? {
+        let wait_t0 = Instant::now();
+        match dup.acquire_frame_cpu(20)? {
             Some(frame) => {
-                let bytes = encoder.encode_bgra(
-                    &frame.bgra,
-                    frame.width as usize,
-                    frame.height as usize,
-                    frame.width as usize * 4,
-                )?;
-                if !bytes.is_empty() {
-                    streamer.push(&bytes)?;
+                let wait_t1 = Instant::now();
+                stats.wait_ms += wait_t1.duration_since(wait_t0).as_secs_f64() * 1000.0;
+                stats.captured += 1;
+                if wait_t1.saturating_duration_since(last_send) >= frame_period {
+                    let enc_t0 = Instant::now();
+                    let bytes = encoder.encode_bgra(
+                        &frame.bgra,
+                        frame.width as usize,
+                        frame.height as usize,
+                        frame.width as usize * 4,
+                    )?;
+                    let enc_t1 = Instant::now();
+                    let send_t0 = Instant::now();
+                    if !bytes.is_empty() {
+                        streamer.push(&bytes)?;
+                    }
+                    let send_t1 = Instant::now();
+                    stats.encode_ms += enc_t1.duration_since(enc_t0).as_secs_f64() * 1000.0;
+                    stats.send_ms += send_t1.duration_since(send_t0).as_secs_f64() * 1000.0;
+                    stats.encoded += 1;
+                    last_send = wait_t1;
+                    last_frame_at = wait_t1;
+                    idle_flushed = false;
+                } else {
+                    stats.skipped += 1;
                 }
-                last_frame_at = Instant::now();
-                idle_flushed = false;
             }
             None => {
                 // No new desktop frame. After a short idle, deliver the last
@@ -282,10 +316,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         if streamer.frames_sent % 30 == 0 && streamer.frames_sent > 0 && streamer.last_report != streamer.frames_sent {
             let el = start.elapsed().as_secs_f64();
             println!(
-                "streamed {} frames, {} bytes ({:.1} fps avg)",
+                "streamed {} frames, {} bytes ({:.1} fps avg) | enc={:.1}ms send={:.1}ms wait={:.1}ms cap={} skip={}",
                 streamer.frames_sent,
                 streamer.bytes_sent,
-                streamer.frames_sent as f64 / el.max(0.001)
+                streamer.frames_sent as f64 / el.max(0.001),
+                stats.encode_ms / stats.encoded.max(1) as f64,
+                stats.send_ms / stats.encoded.max(1) as f64,
+                stats.wait_ms / stats.captured.max(1) as f64,
+                stats.encoded,
+                stats.skipped
             );
             streamer.last_report = streamer.frames_sent;
         }
@@ -399,6 +438,17 @@ fn run_audio(
     }
     println!("audio stopped ({frames_sent} frames)");
     Ok(())
+}
+
+/// Per-stage timing accumulators for diagnosing frame-rate instability.
+#[derive(Default)]
+struct StageStats {
+    captured: u64,
+    encoded: u64,
+    skipped: u64,
+    wait_ms: f64,
+    encode_ms: f64,
+    send_ms: f64,
 }
 
 /// Incremental Annex-B → AVCC mirror streamer, ported from `mirror_pin.rs`.

@@ -50,7 +50,7 @@ fn main() {
     println!("=== OpenH264 encode bench: {w}x{h}, {frames} frames ===");
 
     bench(w, h, frames, OpenH264Config { threads: 0, ..Default::default() }, "screen/medium/threads=auto");
-    bench(w, h, frames, OpenH264Config { threads: 8, ..Default::default() }, "screen/medium/threads=8");
+    bench(w, h, frames, OpenH264Config { threads: 8, max_slice_len: Some(4096), ..Default::default() }, "screen/medium/threads=8");
     bench(
         w, h, frames,
         OpenH264Config { threads: 0, complexity: dt_encode::openh264::Complexity::Low, ..Default::default() },
@@ -64,7 +64,7 @@ fn main() {
             skip_frames: true,
             ..Default::default()
         },
-        "screen/low/threads=8/skip",
+        "screen/low/threads=8/slice4096",
     );
     bench(
         w, h, frames,
@@ -77,3 +77,4 @@ fn main() {
         "camera/low/threads=auto",
     );
 }
+
