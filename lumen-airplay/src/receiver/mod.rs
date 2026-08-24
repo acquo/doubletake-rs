@@ -12,6 +12,12 @@ const MODERN_AIRPLAY_SOURCE_VERSION: &str = "980.71.1";
 pub mod pairing;
 use pairing::{HapStream, ReceiverPairing, SessionKeys};
 
+pub mod fairplay;
+use fairplay::ReceiverFpsap;
+
+pub mod media;
+use media::ReceiverMedia;
+
 use ed25519_dalek::{SigningKey, VerifyingKey};
 use mdns_sd::{ServiceDaemon, ServiceInfo};
 use plist::{Dictionary, Value};
@@ -19,7 +25,7 @@ use rand::rngs::OsRng;
 use rand::RngCore;
 use std::collections::HashMap;
 use std::io::{Read, Write};
-use std::net::{IpAddr, TcpListener, TcpStream, UdpSocket};
+use std::net::{IpAddr, TcpListener, TcpStream};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
@@ -117,7 +123,6 @@ pub struct ReceiverServer {
     pub signing_key: SigningKey,
     verifying_key: VerifyingKey,
     identifier: String,
-    #[allow(dead_code)]
     started: Instant,
     connections: AtomicU64,
 
@@ -390,6 +395,57 @@ fn d_bool(dict: &mut Value, key: &str, value: bool) {
     d_insert(dict, key, Value::Boolean(value));
 }
 
+/// Extracts the `streams[].type` values a SETUP plist requests.
+fn requested_setup_stream_types(body: &[u8]) -> Vec<i64> {
+    let Ok(v) = plist::from_bytes::<Value>(body) else {
+        return Vec::new();
+    };
+    let arr = v
+        .as_dictionary()
+        .and_then(|d| d.get("streams"))
+        .and_then(|s| s.as_array())
+        .or_else(|| v.as_array());
+    let mut types = Vec::new();
+    if let Some(arr) = arr {
+        for item in arr {
+            if let Some(t) = item
+                .as_dictionary()
+                .and_then(|d| d.get("type"))
+                .and_then(|t| t.as_signed_integer())
+            {
+                types.push(t);
+            }
+        }
+    }
+    types
+}
+
+/// Compact text summary of a plist for diagnostics.
+fn summarize_plist(v: &Value) -> String {
+    if let Some(d) = v.as_dictionary() {
+        let parts: Vec<String> = d
+            .iter()
+            .map(|(k, val)| {
+                let s = match val {
+                    Value::Integer(i) => i.to_string(),
+                    Value::String(s) => s.clone(),
+                    Value::Array(a) => format!("[{} items]", a.len()),
+                    Value::Data(d) => format!("{} bytes", d.len()),
+                    Value::Boolean(b) => b.to_string(),
+                    Value::Real(r) => r.to_string(),
+                    _ => "?".to_string(),
+                };
+                format!("{k}={s}")
+            })
+            .collect();
+        parts.join(" ")
+    } else if let Some(a) = v.as_array() {
+        format!("array [{}]", a.len())
+    } else {
+        format!("{v:?}")
+    }
+}
+
 // ---------- mDNS TXT ----------
 
 fn txt_for_airplay(
@@ -473,9 +529,27 @@ impl Write for CtrlStream {
     }
 }
 
+/// Per-connection protocol state carried across the RTSP exchange.
+struct ReceiverSession {
+    pairing: ReceiverPairing,
+    fairplay: Option<ReceiverFpsap>,
+    #[allow(dead_code)]
+    media: Option<ReceiverMedia>,
+}
+
 fn serve_control(s: &ReceiverServer, conn: TcpStream) -> std::io::Result<()> {
     let _ = conn.set_read_timeout(Some(Duration::from_secs(120)));
-    let mut pairing = ReceiverPairing::new(&s.identifier, s.signing_key.clone(), &s.cfg.code);
+    let pairing = ReceiverPairing::new(&s.identifier, s.signing_key.clone(), &s.cfg.code);
+    let fairplay = if s.profile.features & FEATURE_FPSAP25 != 0 {
+        Some(ReceiverFpsap::new())
+    } else {
+        None
+    };
+    let mut session = ReceiverSession {
+        pairing,
+        fairplay,
+        media: None,
+    };
     let mut io = CtrlStream::from_tcp(conn);
     loop {
         let req = match read_request(&mut io) {
@@ -483,7 +557,7 @@ fn serve_control(s: &ReceiverServer, conn: TcpStream) -> std::io::Result<()> {
             Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(()),
             Err(e) => return Err(e),
         };
-        let (resp, enable_hap) = dispatch(s, &req, &mut pairing);
+        let (resp, enable_hap) = dispatch(s, &req, &mut session);
         write_response(&mut io, &req, &resp)?;
         if let Some(keys) = enable_hap {
             io.enable_hap(&keys.read_key, &keys.write_key)?;
@@ -499,6 +573,14 @@ fn serve_control(s: &ReceiverServer, conn: TcpStream) -> std::io::Result<()> {
             *s.hap_enabled.lock().unwrap()
         );
     }
+}
+
+fn clock_headers(s: &ReceiverServer) -> HashMap<String, String> {
+    let millis = s.started.elapsed().as_millis().max(1) as i64;
+    let mut h = HashMap::new();
+    h.insert("X-Apple-RequestReceivedTimestamp".into(), millis.to_string());
+    h.insert("X-Apple-ProcessingTime".into(), "1".to_string());
+    h
 }
 
 fn info_plist(s: &ReceiverServer) -> Response {
@@ -552,9 +634,20 @@ fn info_plist(s: &ReceiverServer) -> Response {
 fn dispatch(
     s: &ReceiverServer,
     req: &Request,
-    pairing: &mut ReceiverPairing,
+    session: &mut ReceiverSession,
 ) -> (Response, Option<SessionKeys>) {
     let path = request_path(&req.uri);
+    // Session-stage requests (fp-setup / SETUP / RECORD / SET_PARAMETER /
+    // TEARDOWN / feedback) must follow a completed pair-verify.
+    let is_session_request = req.method == "SETUP"
+        || req.method == "RECORD"
+        || req.method == "SET_PARAMETER"
+        || req.method == "TEARDOWN"
+        || (req.method == "POST" && (path == "/fp-setup" || path == "/feedback"));
+    if is_session_request && !session.pairing.is_verified() {
+        return (Response::text(455, "pair-verify must complete first"), None);
+    }
+
     match (req.method.as_str(), path) {
         ("GET", "/info") => (info_plist(s), None),
         ("POST", "/pair-pin-start") => {
@@ -566,22 +659,38 @@ fn dispatch(
         }
         ("POST", "/pair-setup") => {
             log::info!("[receiver] pair-setup ({} bytes)", req.body.len());
-            let body = pairing.pair_setup(&req.body);
+            let body = session.pairing.pair_setup(&req.body);
             (Response::ok(body, "application/octet-stream"), None)
         }
         ("POST", "/pair-verify") => {
             log::info!("[receiver] pair-verify ({} bytes)", req.body.len());
-            let (body, keys) = pairing.pair_verify(&req.body);
+            let (body, keys) = session.pairing.pair_verify(&req.body);
             (Response::ok(body, "application/octet-stream"), keys)
         }
         ("POST", "/fp-setup") => {
-            log::info!("[receiver] fp-setup ({} bytes) — not yet implemented", req.body.len());
-            (Response::text(404, "fp-setup not implemented"), None)
+            let fairplay = match &mut session.fairplay {
+                Some(f) if !f.complete() => f,
+                _ => return (Response::text(404, "FairPlay SAP unavailable"), None),
+            };
+            if req.headers.get("x-apple-et").map(|v| v.as_str()) != Some("32") {
+                return (Response::text(400, "fp-setup requires X-Apple-ET: 32"), None);
+            }
+            log::info!("[receiver] fp-setup ({} bytes)", req.body.len());
+            match fairplay.exchange(&req.body) {
+                Ok(body) => (Response::ok(body, "application/octet-stream"), None),
+                Err(e) => {
+                    log::info!("[receiver] fp-setup rejected: {e}");
+                    (Response::text(400, &e.to_string()), None)
+                }
+            }
         }
         ("SETUP", _) => {
+            if session.fairplay.as_ref().map(|f| !f.complete()).unwrap_or(false) {
+                return (Response::text(455, "FairPlay SAP must complete before SETUP"), None);
+            }
+            log::info!("[receiver] SETUP ({} bytes)", req.body.len());
             // KEY capture point: the SETUP body is the plist the client sends,
             // containing audioFormat / sampleRate / channels for the audio stream.
-            log::info!("[receiver] SETUP ({} bytes)", req.body.len());
             if let Some(p) = &s.cfg.audio_dump_path {
                 if let Some(parent) = p.parent() {
                     let _ = std::fs::create_dir_all(parent);
@@ -592,12 +701,94 @@ fn dispatch(
                     let _ = writeln!(f);
                     log::info!("[receiver] dumped SETUP body to {:?}", p);
                 }
+                if let Ok(v) = plist::from_bytes::<Value>(&req.body) {
+                    log::info!("[receiver] SETUP plist: {}", summarize_plist(&v));
+                }
             }
-            (Response::text(455, "SETUP not implemented"), None)
+
+            // Lazily allocate the media endpoints.
+            if session.media.is_none() {
+                let ip = match s.lan_ipv4() {
+                    Ok(ip) => ip,
+                    Err(e) => return (Response::text(500, &e.to_string()), None),
+                };
+                match ReceiverMedia::new(ip, s.cfg.audio_dump_path.clone()) {
+                    Ok(m) => session.media = Some(m),
+                    Err(e) => return (Response::text(500, &e.to_string()), None),
+                }
+            }
+            let media = session.media.as_ref().unwrap();
+            let ep = media.endpoints();
+
+            let requested = requested_setup_stream_types(&req.body);
+            let mut resp = p_dict();
+            d_int(&mut resp, "eventPort", ep.event_port as i64);
+            d_insert(&mut resp, "skipRecord", Value::Boolean(false));
+            let mut tpi = p_dict();
+            d_int(&mut tpi, "ClockID", 0x4454424c54414b45i64);
+            d_string(&mut tpi, "ID", &s.identifier);
+            d_int(&mut tpi, "DeviceType", 1);
+            let lan_ip = s.lan_ipv4().map(|i| i.to_string()).unwrap_or_else(|_| "127.0.0.1".into());
+            d_insert(&mut tpi, "Addresses", Value::Array(vec![Value::String(lan_ip)]));
+            d_insert(&mut tpi, "SupportsClockPortMatchingOverride", Value::Boolean(true));
+            d_insert(&mut resp, "timingPeerInfo", tpi);
+
+            let types: Vec<i64> = if requested.is_empty() { vec![96, 110] } else { requested };
+            let mut stream_responses: Vec<Value> = Vec::new();
+            for t in types {
+                match t {
+                    96 => {
+                        let mut a = p_dict();
+                        d_int(&mut a, "type", 96);
+                        d_int(&mut a, "dataPort", ep.audio_rtp_port as i64);
+                        d_int(&mut a, "controlPort", ep.audio_rtcp_port as i64);
+                        d_int(&mut a, "arrivalToRenderLatencyMs", 0);
+                        let mut sc = p_dict();
+                        let mut rtp = p_dict();
+                        d_int(&mut rtp, "streamConnectionKeyPort", ep.audio_rtp_port as i64);
+                        let mut rtcp = p_dict();
+                        d_int(&mut rtcp, "streamConnectionKeyPort", ep.audio_rtcp_port as i64);
+                        d_insert(&mut sc, "streamConnectionTypeRTP", rtp);
+                        d_insert(&mut sc, "streamConnectionTypeRTCP", rtcp);
+                        d_insert(&mut a, "streamConnections", sc);
+                        stream_responses.push(a);
+                    }
+                    110 => {
+                        let mut v = p_dict();
+                        d_int(&mut v, "type", 110);
+                        d_int(&mut v, "dataPort", ep.video_port as i64);
+                        stream_responses.push(v);
+                    }
+                    _ => {}
+                }
+            }
+            d_insert(&mut resp, "streams", Value::Array(stream_responses));
+
+            let mut buf = Vec::new();
+            let _ = resp.to_writer_binary(&mut buf);
+            let mut r = Response::ok(buf, "application/x-apple-binary-plist");
+            r.headers = clock_headers(s);
+            (r, None)
         }
         ("RECORD", _) => {
             log::info!("[receiver] RECORD");
-            (Response::empty(200), None)
+            let mut r = Response::empty(200);
+            r.headers = clock_headers(s);
+            (r, None)
+        }
+        ("SET_PARAMETER", _) => (Response::empty(200), None),
+        ("POST", "/feedback") => {
+            log::info!("[receiver] /feedback");
+            let mut resp = p_dict();
+            let mut stream = p_dict();
+            d_int(&mut stream, "type", 96);
+            d_int(&mut stream, "sr", 44100);
+            d_insert(&mut resp, "streams", Value::Array(vec![stream]));
+            let mut buf = Vec::new();
+            let _ = resp.to_writer_binary(&mut buf);
+            let mut r = Response::ok(buf, "application/x-apple-binary-plist");
+            r.headers = clock_headers(s);
+            (r, None)
         }
         ("TEARDOWN", _) => (Response::empty(200), None),
         _ => (Response::empty(404), None),
@@ -625,12 +816,6 @@ fn write_response(conn: &mut impl Write, req: &Request, resp: &Response) -> std:
 }
 
 // ---------- trivial interface enumeration (uses no extra crates) ----------
-
-// ---------- minimal media placeholder (filled in next milestones) ----------
-
-struct ReceiverMedia {
-    _sock: UdpSocket,
-}
 
 // Re-exported so the example can start the server.
 pub mod net {

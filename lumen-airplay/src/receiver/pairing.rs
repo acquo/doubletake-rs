@@ -7,7 +7,7 @@ use crate::pairing::{
 };
 use crate::tlv8 as tlv;
 use crate::tlv8::Tlv8Item;
-use chacha20poly1305::aead::{Aead, KeyInit};
+use chacha20poly1305::aead::{Aead, KeyInit, Payload};
 use chacha20poly1305::{ChaCha20Poly1305, Key, Nonce};
 use ed25519_dalek::{Signature, Signer, SigningKey, VerifyingKey};
 use rand::rngs::OsRng;
@@ -526,7 +526,13 @@ impl Read for HapStream {
             self.conn.read_exact(&mut sealed)?;
             let plain = self
                 .read_cipher
-                .decrypt(Nonce::from_slice(&Self::nonce(self.read_nonce)), sealed.as_slice())
+                .decrypt(
+                    Nonce::from_slice(&Self::nonce(self.read_nonce)),
+                    Payload {
+                        msg: sealed.as_slice(),
+                        aad: &size_bytes,
+                    },
+                )
                 .map_err(|_| std::io::Error::other("HAP frame decrypt failed"))?;
             self.read_nonce += 1;
             self.read_buf = plain;
@@ -548,7 +554,13 @@ impl Write for HapStream {
             let mut frame = size_bytes.to_vec();
             let sealed = self
                 .write_cipher
-                .encrypt(Nonce::from_slice(&Self::nonce(self.write_nonce)), chunk)
+                .encrypt(
+                    Nonce::from_slice(&Self::nonce(self.write_nonce)),
+                    Payload {
+                        msg: chunk,
+                        aad: &size_bytes,
+                    },
+                )
                 .map_err(|_| std::io::Error::other("HAP frame encrypt failed"))?;
             frame.extend_from_slice(&sealed);
             self.conn.write_all(&frame)?;
