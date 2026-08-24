@@ -357,15 +357,18 @@ impl StereoResampler {
     fn process(&mut self, stereo: &[f64]) -> Vec<i16> {
         let ratio = self.src_rate / self.dst_rate;
         let frames = stereo.len() / 2;
+        let has_tail = self.tail.is_some();
         let mut ext = Vec::with_capacity(stereo.len() + 2);
         if let Some(t) = self.tail {
             ext.extend_from_slice(&t);
         }
         ext.extend_from_slice(stereo);
+        let ext_frames = frames + has_tail as usize;
 
         let mut out: Vec<i16> = Vec::with_capacity((frames as f64 / ratio) as usize * 2);
-        // p = source position in ext (tail offset +1). Safe while p+1 < ext_frames.
-        while self.phase + 1.0 < frames as f64 {
+        // p = source position in ext (tail offset +1). Safe while p + 1 <
+        // ext_frames so both interpolation endpoints exist.
+        while self.phase + 2.0 < ext_frames as f64 {
             let p = self.phase + 1.0;
             let i0 = p.floor() as usize;
             let frac = p - i0 as f64;
@@ -391,5 +394,77 @@ fn clamp_i16(v: f64) -> i16 {
 fn close(handle: HANDLE) {
     unsafe {
         let _ = CloseHandle(handle);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn resampler_output_length_48k_to_44k() {
+        // 4800 source frames at 48 kHz → ~4410 frames at 44.1 kHz.
+        let mut r = StereoResampler::new(48000.0, 44100.0);
+        let src = vec![0.0f64; 4800 * 2];
+        let out = r.process(&src);
+        let frames = out.len() / 2;
+        assert!(
+            (4380..=4440).contains(&frames),
+            "expected ~4410 output frames, got {frames}"
+        );
+    }
+
+    #[test]
+    fn resampler_dc_preserved() {
+        let mut r = StereoResampler::new(48000.0, 44100.0);
+        let src = vec![0.5f64; 4096 * 2];
+        let out = r.process(&src);
+        assert!(!out.is_empty());
+        // 0.5 * 32767 ≈ 16384, allow small interpolation slack.
+        for v in out.iter().step_by(2) {
+            assert!((16378..=16390).contains(v), "DC drifted: {v}");
+        }
+    }
+
+    #[test]
+    fn resampler_continuous_across_buffers() {
+        // A rising ramp split across two process() calls must stay monotonic
+        // (no jump at the buffer boundary).
+        let mut r = StereoResampler::new(48000.0, 44100.0);
+        let mut all: Vec<i16> = Vec::new();
+        for chunk_start in [0usize, 2048] {
+            let mut src = Vec::with_capacity(2048 * 2);
+            for i in 0..2048 {
+                let v = (chunk_start + i) as f64 / 10000.0;
+                src.push(v);
+                src.push(v);
+            }
+            all.extend_from_slice(&r.process(&src));
+        }
+        // Monotonic (non-decreasing) within small tolerance.
+        for w in all.windows(2) {
+            assert!(
+                w[1] >= w[0] - 2,
+                "resampler jumped backwards: {} -> {}",
+                w[0],
+                w[1]
+            );
+        }
+    }
+
+    #[test]
+    fn push_frames_chunks_correctly() {
+        let (tx, rx) = channel();
+        let mut buf: Vec<i16> = Vec::new();
+        // Partial frame (100 < 704) then enough to complete one frame.
+        push_frames(&mut buf, &vec![0i16; 100], &tx);
+        assert!(rx.try_recv().is_err(), "no frame before 704 samples");
+        push_frames(&mut buf, &vec![0i16; 700], &tx);
+        let frame = rx.try_recv().expect("one full frame");
+        assert_eq!(frame.len(), FRAME_SAMPLES * CHANNELS);
+        // 96 samples remain buffered; no second frame yet.
+        assert!(rx.try_recv().is_err());
+        assert_eq!(buf.len(), 96);
+        drop(tx);
     }
 }
