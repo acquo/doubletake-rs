@@ -55,6 +55,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut seconds: u64 = 0; // 0 = run until Ctrl+C
     let mut fps: u32 = 30;
     let mut threads: u16 = 8;
+    let mut encoder_kind: String = "openh264".into();
     let mut i = 3;
     while i < args.len() {
         match args[i].as_str() {
@@ -88,6 +89,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             "--threads" => {
                 i += 1;
                 threads = args[i].parse()?;
+            }
+            "--encoder" => {
+                i += 1;
+                encoder_kind = args[i].clone();
             }
             s if s.starts_with("--") => {
                 eprintln!("unknown option: {s}");
@@ -200,14 +205,43 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // 5. Capture + encode + stream until Ctrl+C.
     let mut dup = DesktopDuplicator::new(0)?;
     println!("desktop: {}x{} (duplication ready)", dup.width, dup.height);
-    let mut encoder = OpenH264Encoder::new(OpenH264Config {
-        bitrate_bps: bitrate_kbps * 1000,
-        fps: fps as f32,
-        threads, // explicit threads beat auto on complex content (32 -> 64 fps)
-        skip_frames: true, // let the rate controller bound frame sizes
-        ..Default::default()
-    })?;
-    println!("OpenH264 encoder ready ({bitrate_kbps} kbps, {fps} fps, {threads} threads)");
+
+    let use_nvenc = encoder_kind == "nvenc";
+    let mut nvenc: Option<(
+        dt_encode::H264Encoder,
+        windows::Win32::Graphics::Direct3D11::ID3D11Texture2D,
+    )> = None;
+    let mut openh264: Option<OpenH264Encoder> = None;
+
+    if use_nvenc {
+        let nv = std::sync::Arc::new(dt_encode::NvEncoder::load()?);
+        let (major, minor) = nv.major_minor();
+        println!("NVENC API {major}.{minor} (preset defaults — driver 591.86 config bug)");
+        let mut enc = dt_encode::H264Encoder::new(
+            nv,
+            dup.device_raw(),
+            dup.width,
+            dup.height,
+            fps,
+            bitrate_kbps * 1000,
+            dt_encode::NV_ENC_BUFFER_FORMAT_ARGB,
+        )?;
+        let persistent = dup.create_gpu_texture()?;
+        enc.register_texture(
+            windows::core::Interface::as_raw(&persistent) as *mut std::ffi::c_void,
+        )?;
+        println!("NVENC zero-copy ready (note: cursor overlay not supported on this path)");
+        nvenc = Some((enc, persistent));
+    } else {
+        openh264 = Some(OpenH264Encoder::new(OpenH264Config {
+            bitrate_bps: bitrate_kbps * 1000,
+            fps: fps as f32,
+            threads, // explicit threads beat auto on complex content (32 -> 64 fps)
+            skip_frames: true, // let the rate controller bound frame sizes
+            ..Default::default()
+        })?);
+        println!("OpenH264 encoder ready ({bitrate_kbps} kbps, {fps} fps, {threads} threads)");
+    }
 
     let stop = Arc::new(AtomicBool::new(false));
     let stop2 = stop.clone();
@@ -266,19 +300,36 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     while !stop.load(Ordering::Relaxed) && (seconds == 0 || start.elapsed().as_secs() < seconds) {
         let wait_t0 = Instant::now();
-        match dup.acquire_frame_cpu(20)? {
-            Some(frame) => {
+        let frame_opt = if use_nvenc {
+            dup.acquire_frame(20)?.map(Acquired::Tex)
+        } else {
+            dup.acquire_frame_cpu(20)?.map(Acquired::Cpu)
+        };
+        match frame_opt {
+            Some(acq) => {
                 let wait_t1 = Instant::now();
                 stats.wait_ms += wait_t1.duration_since(wait_t0).as_secs_f64() * 1000.0;
                 stats.captured += 1;
                 if wait_t1.saturating_duration_since(last_send) >= frame_period {
                     let enc_t0 = Instant::now();
-                    let bytes = encoder.encode_bgra(
-                        &frame.bgra,
-                        frame.width as usize,
-                        frame.height as usize,
-                        frame.width as usize * 4,
-                    )?;
+                    let bytes = match acq {
+                        Acquired::Tex(texture) => {
+                            let (enc, persistent) = nvenc.as_mut().expect("nvenc");
+                            dup.copy_texture(persistent, &texture)?;
+                            let b = enc.encode_frame(streamer.frames_sent == 0)?;
+                            dup.release_frame();
+                            b
+                        }
+                        Acquired::Cpu(frame) => {
+                            let enc = openh264.as_mut().expect("openh264");
+                            enc.encode_bgra(
+                                &frame.bgra,
+                                frame.width as usize,
+                                frame.height as usize,
+                                frame.width as usize * 4,
+                            )?
+                        }
+                    };
                     let enc_t1 = Instant::now();
                     let send_t0 = Instant::now();
                     if !bytes.is_empty() {
@@ -293,6 +344,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     idle_flushed = false;
                 } else {
                     stats.skipped += 1;
+                    if let Acquired::Tex(_) = acq {
+                        dup.release_frame();
+                    }
                 }
             }
             None => {
@@ -449,6 +503,13 @@ struct StageStats {
     wait_ms: f64,
     encode_ms: f64,
     send_ms: f64,
+}
+
+/// A captured frame from either the GPU-texture path (NVENC) or the CPU
+/// readback path (OpenH264).
+enum Acquired {
+    Tex(windows::Win32::Graphics::Direct3D11::ID3D11Texture2D),
+    Cpu(dt_capture::dxgi::CpuFrame),
 }
 
 /// Incremental Annex-B → AVCC mirror streamer, ported from `mirror_pin.rs`.

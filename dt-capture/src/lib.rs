@@ -8,4 +8,4 @@ pub mod cursor;
 pub mod dxgi;
 
 pub use cursor::CursorOverlay;
-pub use dxgi::{DesktopDuplicator, DxgiError};
+pub use dxgi::{CpuFrame, DesktopDuplicator, DxgiError};

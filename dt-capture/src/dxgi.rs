@@ -13,8 +13,8 @@ use windows::Win32::Graphics::Direct3D::{
 };
 use windows::Win32::Graphics::Direct3D11::{
     D3D11CreateDevice, D3D11_CPU_ACCESS_READ, D3D11_CREATE_DEVICE_FLAG, D3D11_MAP_READ,
-    D3D11_MAPPED_SUBRESOURCE, D3D11_SDK_VERSION, D3D11_TEXTURE2D_DESC, D3D11_USAGE_STAGING,
-    ID3D11Device, ID3D11DeviceContext, ID3D11Resource, ID3D11Texture2D,
+    D3D11_MAPPED_SUBRESOURCE, D3D11_SDK_VERSION, D3D11_TEXTURE2D_DESC, D3D11_USAGE_DEFAULT,
+    D3D11_USAGE_STAGING, ID3D11Device, ID3D11DeviceContext, ID3D11Resource, ID3D11Texture2D,
 };
 use windows::Win32::Graphics::Dxgi::Common::{
     DXGI_FORMAT, DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_SAMPLE_DESC,
@@ -110,6 +110,41 @@ impl DesktopDuplicator {
     /// The D3D11 device that owns captured textures (shared with NVENC).
     pub fn device_raw(&self) -> *mut c_void {
         self.device.as_raw() as *mut c_void
+    }
+
+    /// Creates a persistent GPU texture of the desktop size/format, used as
+    /// the NVENC zero-copy input: each captured surface is copied into it with
+    /// [`DesktopDuplicator::copy_texture`] (GPU-side, no CPU readback).
+    pub fn create_gpu_texture(&self) -> Result<ID3D11Texture2D, DxgiError> {
+        let desc = D3D11_TEXTURE2D_DESC {
+            Width: self.width,
+            Height: self.height,
+            MipLevels: 1,
+            ArraySize: 1,
+            Format: DXGI_FORMAT_B8G8R8A8_UNORM,
+            SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+            Usage: D3D11_USAGE_DEFAULT,
+            BindFlags: 0,
+            CPUAccessFlags: 0,
+            MiscFlags: 0,
+        };
+        let mut tex: Option<ID3D11Texture2D> = None;
+        unsafe { self.device.CreateTexture2D(&desc, None, Some(&mut tex))? };
+        tex.ok_or_else(|| DxgiError::Windows(windows::core::Error::from_win32()))
+    }
+
+    /// GPU-copies `src` into `dst` (must have identical format and size).
+    pub fn copy_texture(
+        &self,
+        dst: &ID3D11Texture2D,
+        src: &ID3D11Texture2D,
+    ) -> Result<(), DxgiError> {
+        unsafe {
+            let d: ID3D11Resource = dst.cast()?;
+            let s: ID3D11Resource = src.cast()?;
+            self.context.CopyResource(&d, &s);
+        }
+        Ok(())
     }
 
     /// Waits up to `timeout_ms` for a new desktop frame. Returns the texture
