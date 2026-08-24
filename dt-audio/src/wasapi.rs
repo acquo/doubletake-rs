@@ -13,7 +13,8 @@ use windows::Win32::Media::Audio::{
     IAudioClient, IMMDeviceEnumerator, MMDeviceEnumerator, WAVEFORMATEX, WAVEFORMATEXTENSIBLE,
 };
 use windows::Win32::System::Com::{
-    CoCreateInstance, CoInitializeEx, CoUninitialize, CLSCTX_ALL, COINIT_MULTITHREADED,
+    CoCreateInstance, CoInitializeEx, CoTaskMemFree, CoUninitialize, CLSCTX_ALL,
+    COINIT_MULTITHREADED,
 };
 use windows::Win32::System::Threading::{CreateEventW, WaitForSingleObject, INFINITE};
 
@@ -158,6 +159,7 @@ fn run_inner(tx: Sender<Vec<i16>>) -> Result<(), AudioError> {
         src_channels = ch;
         mix_format = Some(MixFormat::from_wave_format(fmt));
         unsafe { client.Initialize(AUDCLNT_SHAREMODE_SHARED, flags, hns_buffer, 0, mix, None)? };
+        unsafe { CoTaskMemFree(Some(mix as *const _ as *mut _)) };
     }
 
     let capture: IAudioCaptureClient = unsafe { client.GetService()? };

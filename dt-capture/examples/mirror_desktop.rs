@@ -203,6 +203,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // video frame (the receiver ties audio to an active video stream).
     let first_frame = session.first_frame_sent.clone();
     let audio_stream = if !no_audio {
+        println!(
+            "audio ports from receiver: data={} ctrl={}",
+            session.audio_data_port, session.audio_ctrl_port
+        );
         match session.make_audio_stream()? {
             Some(as_) => Some(as_),
             None => {
