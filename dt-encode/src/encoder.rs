@@ -224,6 +224,51 @@ impl H264Encoder {
         Ok(out)
     }
 
+    /// Encodes one frame from `texture`, registering it with NVENC for this
+    /// frame and unregistering afterwards. This is the reliable path for
+    /// Desktop Duplication, whose surfaces change every frame — a persistent
+    /// registered texture + GPU copy can race NVENC and yield stale frames.
+    pub fn encode_external_texture(
+        &mut self,
+        texture: *mut c_void,
+        force_idr: bool,
+    ) -> Result<Vec<u8>, NvEncoderError> {
+        let mut reg: nv::NV_ENC_REGISTER_RESOURCE = unsafe { std::mem::zeroed() };
+        reg.version = nvencapi_struct_version(4);
+        reg.resourceType = NV_ENC_INPUT_RESOURCE_TYPE_DIRECTX as i32;
+        reg.width = self.width;
+        reg.height = self.height;
+        reg.pitch = 0;
+        reg.subResourceIndex = 0;
+        reg.resourceToRegister = texture;
+        reg.bufferFormat = NV_ENC_BUFFER_FORMAT_ARGB as i32;
+        reg.bufferUsage = NV_ENC_INPUT_IMAGE as i32;
+        let status = unsafe {
+            (self.nv.api.nvEncRegisterResource.expect("register"))(self.session, &mut reg)
+        };
+        if status != NV_ENC_SUCCESS {
+            self.registered = std::ptr::null_mut();
+            return Err(NvEncoderError::Status(status as u32));
+        }
+        self.registered = reg.registeredResource;
+
+        let bytes = self.encode_frame(force_idr);
+
+        // Unregister this frame's resource so the next frame can register a
+        // fresh one (Desktop Duplication hands us a new surface each frame).
+        let status = unsafe {
+            (self.nv.api.nvEncUnregisterResource.expect("unregister"))(
+                self.session,
+                self.registered,
+            )
+        };
+        self.registered = std::ptr::null_mut();
+        if status != NV_ENC_SUCCESS {
+            return Err(NvEncoderError::Status(status as u32));
+        }
+        bytes
+    }
+
     /// Requests an IDR (keyframe) on the next encode.
     pub fn request_keyframe(&mut self) {
         self.frame_index += 1; // force_idr handled by caller via encode_frame(true)

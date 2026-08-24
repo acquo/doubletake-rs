@@ -230,17 +230,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("desktop: {}x{} (duplication ready)", dup.width, dup.height);
 
     let use_nvenc = encoder_kind == "nvenc";
-    let mut nvenc: Option<(
-        dt_encode::H264Encoder,
-        windows::Win32::Graphics::Direct3D11::ID3D11Texture2D,
-    )> = None;
+    let mut nvenc: Option<dt_encode::H264Encoder> = None;
     let mut openh264: Option<OpenH264Encoder> = None;
 
     if use_nvenc {
         let nv = std::sync::Arc::new(dt_encode::NvEncoder::load()?);
         let (major, minor) = nv.major_minor();
         println!("NVENC API {major}.{minor} (preset defaults — driver 591.86 config bug)");
-        let mut enc = dt_encode::H264Encoder::new(
+        let enc = dt_encode::H264Encoder::new(
             nv,
             dup.device_raw(),
             dup.width,
@@ -249,12 +246,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             bitrate_kbps * 1000,
             dt_encode::NV_ENC_BUFFER_FORMAT_ARGB,
         )?;
-        let persistent = dup.create_gpu_texture()?;
-        enc.register_texture(
-            windows::core::Interface::as_raw(&persistent) as *mut std::ffi::c_void,
-        )?;
-        println!("NVENC zero-copy ready (note: cursor overlay not supported on this path)");
-        nvenc = Some((enc, persistent));
+        println!("NVENC ready (per-frame register; note: cursor overlay not supported on this path)");
+        nvenc = Some(enc);
     } else {
         openh264 = Some(OpenH264Encoder::new(OpenH264Config {
             bitrate_bps: bitrate_kbps * 1000,
@@ -337,9 +330,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     let enc_t0 = Instant::now();
                     let bytes = match acq {
                         Acquired::Tex(texture) => {
-                            let (enc, persistent) = nvenc.as_mut().expect("nvenc");
-                            dup.copy_texture(persistent, &texture)?;
-                            let b = enc.encode_frame(streamer.frames_sent == 0)?;
+                            let enc = nvenc.as_mut().expect("nvenc");
+                            let b = enc.encode_external_texture(
+                                windows::core::Interface::as_raw(&texture)
+                                    as *mut std::ffi::c_void,
+                                streamer.frames_sent == 0,
+                            )?;
                             dup.release_frame();
                             b
                         }
