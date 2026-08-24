@@ -73,7 +73,7 @@ impl<'de> Deserialize<'de> for PlistData {
 }
 
 /// An integer, which some receivers send as a real (float) instead.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct PlistNumber(pub i64);
 
 impl From<i64> for PlistNumber {
@@ -111,7 +111,7 @@ impl<'de> Deserialize<'de> for PlistNumber {
 }
 
 /// A boolean, which some receivers send as 0/1 instead.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct PlistFlag(pub bool);
 
 impl From<bool> for PlistFlag {
