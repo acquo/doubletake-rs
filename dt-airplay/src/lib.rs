@@ -3,6 +3,7 @@
 //! Rust port of the protocol/auth code from
 //! <https://github.com/omarroth/doubletake> (GPL-3.0).
 
+pub mod audio;
 pub mod client;
 pub mod credentials;
 pub mod digest;

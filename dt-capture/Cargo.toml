@@ -20,5 +20,6 @@ windows = { version = "0.58", features = [
 [dev-dependencies]
 ctrlc = "3"
 dt-airplay = { path = "../dt-airplay" }
+dt-audio = { path = "../dt-audio" }
 dt-encode = { path = "../dt-encode" }
 env_logger = "0.11"

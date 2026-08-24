@@ -316,6 +316,12 @@ fn ntp_boot_timestamp(app_start: Instant) -> u64 {
     (sec << 32) | frac
 }
 
+/// 64-bit NTP fixed-point timestamp of the process start, anchored to the
+/// 1900 epoch (used by the NTP timing responder and audio TimeAnnounce).
+pub fn ntp_network_time() -> u64 {
+    ntp_boot_timestamp(app_start())
+}
+
 /// An active screen mirroring session.
 pub struct MirrorSession {
     pub client: Client,
@@ -339,6 +345,16 @@ pub struct MirrorSession {
     /// responder holds its own clone, but the original must not be dropped
     /// while legacy receivers may still probe it).
     _timing_socket: Option<UdpSocket>,
+    /// Local UDP socket for audio RTP data (kept for the session lifetime).
+    pub audio_data_socket: Option<UdpSocket>,
+    /// Local UDP socket for audio control/sync packets.
+    pub audio_ctrl_socket: Option<UdpSocket>,
+    /// Receiver's audio RTP data port.
+    pub audio_data_port: u16,
+    /// Receiver's audio control port.
+    pub audio_ctrl_port: u16,
+    /// Negotiated audio latency in 44.1 kHz samples.
+    pub audio_latency_samples: u32,
 }
 
 /// Negotiates a mirroring session with the receiver.
@@ -404,7 +420,9 @@ pub fn setup_mirror_session(
     // Consecutive UDP ports: timing, audio control, audio data.
     let mut audio_ports = allocate_consecutive_udp_ports(3, port_min, port_max)?;
     let timing_socket = audio_ports.remove(0);
-    let audio_ctrl_port = audio_ports[0]
+    let audio_ctrl_socket = audio_ports.remove(0);
+    let audio_data_socket = audio_ports.remove(0);
+    let audio_ctrl_port = audio_ctrl_socket
         .local_addr()
         .map_err(|e| Error::from_io("local addr", e))?
         .port();
@@ -509,7 +527,7 @@ pub fn setup_mirror_session(
     d_int(&mut audio_stream_desc, "ct", 2); // ALAC
     d_int(&mut audio_stream_desc, "spf", 352);
     d_int(&mut audio_stream_desc, "sr", 44100);
-    d_int(&mut audio_stream_desc, "audioFormat", 0x10000); // ALAC audioFormat
+    d_int(&mut audio_stream_desc, "audioFormat", 0x40000); // ALAC audioFormat (matches upstream)
     d_string(&mut audio_stream_desc, "audioMode", "default");
     d_bool(&mut audio_stream_desc, "usingScreen", true);
     d_int(&mut audio_stream_desc, "latencyMin", 0);
@@ -528,6 +546,21 @@ pub fn setup_mirror_session(
         p
     };
     let (audio_resp, _, _) = send_setup(&mut client, &audio_uri, "audio stream", &audio_setup_plist, &mut media_clock)?;
+
+    // Extract the receiver's audio RTP data/control ports (stream type 96).
+    let mut audio_data_port = 0u16;
+    let mut audio_ctrl_port_remote = 0u16;
+    if let Some(streams) = audio_resp.as_dictionary().and_then(|m| m.get("streams")).and_then(Value::as_array) {
+        for s in streams {
+            if let Some(dict) = s.as_dictionary() {
+                if plist_int(dict.get("type").unwrap_or(&plist_dict_int(0))) == 96 {
+                    audio_data_port = plist_int(dict.get("dataPort").unwrap_or(&plist_dict_int(0))) as u16;
+                    audio_ctrl_port_remote = plist_int(dict.get("controlPort").unwrap_or(&plist_dict_int(0))) as u16;
+                }
+            }
+        }
+    }
+    log::debug!("[SETUP] audio stream: dataPort={audio_data_port} controlPort={audio_ctrl_port_remote}");
 
     if !modern_control_setup {
         skip_record = audio_resp
@@ -672,6 +705,11 @@ pub fn setup_mirror_session(
         timestamp_bias: session_latency,
         media_clock,
         _timing_socket: Some(timing_socket),
+        audio_data_socket: Some(audio_data_socket),
+        audio_ctrl_socket: Some(audio_ctrl_socket),
+        audio_data_port,
+        audio_ctrl_port: audio_ctrl_port_remote,
+        audio_latency_samples,
     })
 }
 
@@ -708,6 +746,32 @@ fn dict_of(key: &str, value: &str) -> Value {
 }
 
 impl MirrorSession {
+    /// Builds the RTP audio stream for this session, or `None` if the
+    /// receiver provided no audio ports. The sockets are cloned so the
+    /// session keeps its handles.
+    pub fn make_audio_stream(&self) -> Result<Option<crate::audio::AudioStream>> {
+        let (Some(data), Some(ctrl)) = (&self.audio_data_socket, &self.audio_ctrl_socket) else {
+            return Ok(None);
+        };
+        if self.audio_data_port == 0 || self.audio_ctrl_port == 0 {
+            return Ok(None);
+        }
+        let data_clone = data
+            .try_clone()
+            .map_err(|e| Error::from_io("clone audio data socket", e))?;
+        let ctrl_clone = ctrl
+            .try_clone()
+            .map_err(|e| Error::from_io("clone audio ctrl socket", e))?;
+        Ok(Some(crate::audio::AudioStream::new(
+            &self.client.host,
+            self.audio_data_port,
+            self.audio_ctrl_port,
+            data_clone,
+            ctrl_clone,
+            self.audio_latency_samples,
+        )?))
+    }
+
     /// One atomic timestamp/timeline pair for a VCL header.
     pub fn frame_time_now(&mut self) -> (u64, u64) {
         let bias = if self.timestamp_bias > Duration::ZERO {

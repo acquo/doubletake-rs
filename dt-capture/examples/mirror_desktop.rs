@@ -50,6 +50,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut latency_ms: u64 = 100;
     let mut creds_path = CredentialStore::default_path();
     let mut no_encrypt = false;
+    let mut no_audio = false;
     let mut i = 3;
     while i < args.len() {
         match args[i].as_str() {
@@ -67,6 +68,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 creds_path = args[i].clone().into();
             }
             "--no-encrypt" => no_encrypt = true,
+            "--no-audio" => no_audio = true,
             s if s.starts_with("--") => {
                 eprintln!("unknown option: {s}");
                 std::process::exit(2);
@@ -188,6 +190,37 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         stop2.store(true, Ordering::Relaxed);
     })?;
 
+    // 6. Audio: WASAPI loopback → ALAC verbatim → RTP, started after the first
+    // video frame (the receiver ties audio to an active video stream).
+    let first_frame = session.first_frame_sent.clone();
+    let audio_stream = if !no_audio {
+        match session.make_audio_stream()? {
+            Some(as_) => Some(as_),
+            None => {
+                println!("receiver provided no audio ports — continuing without audio");
+                None
+            }
+        }
+    } else {
+        None
+    };
+    let audio_stop = stop.clone();
+    if let Some(as_) = audio_stream {
+        let audio_thread = std::thread::Builder::new()
+            .name("mirror-audio".into())
+            .spawn(move || {
+                let result = (|| -> Result<(), Box<dyn std::error::Error>> {
+                    let capture = dt_audio::start()?;
+                    println!("WASAPI loopback audio capture started");
+                    run_audio(as_, capture, first_frame, audio_stop)
+                })();
+                if let Err(e) = result {
+                    println!("audio error: {e}");
+                }
+            })?;
+        std::mem::forget(audio_thread); // detached; exits on Ctrl+C
+    }
+
     let mut streamer = H264Streamer::new(&mut session);
     let mut last_heartbeat = Instant::now();
     let mut last_feedback = Instant::now();
@@ -251,6 +284,91 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
     session.teardown()?;
     println!("teardown OK");
+    Ok(())
+}
+
+/// Runs the audio stream: waits for the first video frame, then encodes
+/// WASAPI loopback PCM as ALAC verbatim frames and sends them over RTP with
+/// periodic NTP TimeAnnounce sync packets (port of upstream `StreamAudio`).
+fn run_audio(
+    mut audio: dt_airplay::audio::AudioStream,
+    capture: dt_audio::LoopbackCapture,
+    first_frame: Arc<AtomicBool>,
+    stop: Arc<AtomicBool>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    // The receiver processes audio only in the context of an active video
+    // stream; wait for the first video frame before starting.
+    while !first_frame.load(Ordering::Relaxed) && !stop.load(Ordering::Relaxed) {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    if stop.load(Ordering::Relaxed) {
+        return Ok(());
+    }
+    let _ = audio.set_ctrl_nonblocking();
+
+    // Apple starts each audio timeline at a random 32-bit RTP epoch.
+    let mut rtp_time: u32 = (std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_err(|e| format!("clock: {e}"))?
+        .as_nanos() as u32)
+        | 0x8000_0000;
+    let mut seq: u16 = 1; // first frame = seq 1
+    audio.rtp_time = rtp_time;
+
+    // Establish the clock mapping before sending media (reset bit set).
+    let net_time = dt_airplay::mirror::ntp_network_time();
+    audio.send_sync_packet(net_time, true)?;
+    println!("audio started (rtp epoch {rtp_time})");
+
+    // FEC: burst the first 8 frames, then interleave a retransmit before each
+    // new frame (port of upstream's burst-8 + retransmit).
+    const DEPTH: usize = 8;
+    let mut retransmit: Vec<Option<(Vec<u8>, u32, u16)>> = vec![None; DEPTH];
+    let mut idx = 0usize;
+    let mut burst_done = false;
+    let mut last_sync = Instant::now();
+    let mut frames_sent: u64 = 0;
+
+    while !stop.load(Ordering::Relaxed) {
+        if last_sync.elapsed() >= Duration::from_secs(1) {
+            let net = dt_airplay::mirror::ntp_network_time();
+            audio.send_sync_packet(net, false)?;
+            last_sync = Instant::now();
+        }
+        audio.drain_control();
+
+        let pcm = match capture.recv_frame() {
+            Ok(p) => p,
+            Err(_) => break, // capture thread gone
+        };
+        let payload = dt_airplay::audio::encode_alac_verbatim(&pcm, dt_airplay::audio::SPF as usize, 2);
+
+        if !burst_done {
+            audio.send_frame(&payload, rtp_time, seq)?;
+            retransmit[idx] = Some((payload, rtp_time, seq));
+            idx += 1;
+            if idx >= DEPTH {
+                burst_done = true;
+                idx = 0;
+            }
+        } else {
+            if let Some((old, old_rtp, old_seq)) = retransmit[idx].take() {
+                audio.send_frame(&old, old_rtp, old_seq)?;
+                retransmit[idx] = Some((old, old_rtp, old_seq));
+            }
+            audio.send_frame(&payload, rtp_time, seq)?;
+            retransmit[idx] = Some((payload, rtp_time, seq));
+            idx = (idx + 1) % DEPTH;
+        }
+
+        seq = seq.wrapping_add(1);
+        rtp_time = rtp_time.wrapping_add(dt_airplay::audio::SPF);
+        frames_sent += 1;
+        if frames_sent % 100 == 0 {
+            println!("audio: {frames_sent} frames sent");
+        }
+    }
+    println!("audio stopped ({frames_sent} frames)");
     Ok(())
 }
 

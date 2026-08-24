@@ -2,6 +2,7 @@
 resolver = "2"
 members = [
     "dt-airplay",
+    "dt-audio",
     "dt-capture",
     "dt-encode",
 ]
