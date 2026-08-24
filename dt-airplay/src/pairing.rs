@@ -785,7 +785,7 @@ impl PairingSession {
 
 /// The client name shown by the receiver while it asks the user to allow
 /// pairing. Prefer the machine's hostname, sanitized.
-fn pairing_client_name() -> String {
+pub(crate) fn pairing_client_name() -> String {
     let hostname = std::env::var("COMPUTERNAME")
         .or_else(|_| std::env::var("HOSTNAME"))
         .unwrap_or_default();
