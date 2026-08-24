@@ -161,7 +161,11 @@ impl AudioStream {
         self.data_socket
             .send_to(&pkt, self.remote_data)
             .map_err(|e| Error::from_io("audio rtp send", e))?;
-        self.rtp_time = rtp_time;
+        // Advance the clock only forward (modular, like upstream); retransmits
+        // carry old timestamps and must not move the position backwards.
+        if (rtp_time.wrapping_sub(self.rtp_time) as i32) >= 0 {
+            self.rtp_time = rtp_time;
+        }
         Ok(())
     }
 

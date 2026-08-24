@@ -554,8 +554,33 @@ pub fn setup_mirror_session(
         for s in streams {
             if let Some(dict) = s.as_dictionary() {
                 if plist_int(dict.get("type").unwrap_or(&plist_dict_int(0))) == 96 {
-                    audio_data_port = plist_int(dict.get("dataPort").unwrap_or(&plist_dict_int(0))) as u16;
-                    audio_ctrl_port_remote = plist_int(dict.get("controlPort").unwrap_or(&plist_dict_int(0))) as u16;
+                    audio_data_port =
+                        plist_int(dict.get("dataPort").unwrap_or(&plist_dict_int(0))) as u16;
+                    audio_ctrl_port_remote =
+                        plist_int(dict.get("controlPort").unwrap_or(&plist_dict_int(0))) as u16;
+                    // Modern receivers nest the ports under streamConnections.
+                    if let Some(conns) = dict.get("streamConnections").and_then(Value::as_dictionary) {
+                        if let Some(rtp) = conns
+                            .get("streamConnectionTypeRTP")
+                            .and_then(Value::as_dictionary)
+                        {
+                            if let Some(p) = rtp.get("streamConnectionKeyPort") {
+                                if plist_int(p) > 0 {
+                                    audio_data_port = plist_int(p) as u16;
+                                }
+                            }
+                        }
+                        if let Some(rtcp) = conns
+                            .get("streamConnectionTypeRTCP")
+                            .and_then(Value::as_dictionary)
+                        {
+                            if let Some(p) = rtcp.get("streamConnectionKeyPort") {
+                                if plist_int(p) > 0 {
+                                    audio_ctrl_port_remote = plist_int(p) as u16;
+                                }
+                            }
+                        }
+                    }
                 }
             }
         }
