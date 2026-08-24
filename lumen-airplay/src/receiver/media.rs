@@ -154,12 +154,14 @@ fn drain_audio(sock: UdpSocket, dump: Option<PathBuf>, stop: Arc<AtomicBool>, wr
     }
     let mut buf = [0u8; 4096];
     let mut logged = 0usize;
+    let mut total = 0usize;
     loop {
         if stop.load(Ordering::SeqCst) {
             return;
         }
         match sock.recv_from(&mut buf) {
             Ok((n, _addr)) => {
+                total += 1;
                 if write_dump {
                     if let Some(path) = &dump {
                         if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
@@ -171,6 +173,9 @@ fn drain_audio(sock: UdpSocket, dump: Option<PathBuf>, stop: Arc<AtomicBool>, wr
                     if logged < 8 {
                         log::info!("[receiver] audio RTP packet {} bytes: {:02x?}", n, &buf[..n.min(28)]);
                         logged += 1;
+                    }
+                    if total % 50 == 0 {
+                        log::info!("[receiver] audio RTP received {} total", total);
                     }
                 }
             }
@@ -191,3 +196,61 @@ fn drain_udp_discard(sock: UdpSocket, stop: Arc<AtomicBool>) {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::net::{Ipv4Addr, SocketAddr, UdpSocket};
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    #[test]
+    fn audio_socket_receives_loopback() {
+        let any = Ipv4Addr::UNSPECIFIED;
+        let sock = UdpSocket::bind(SocketAddr::from((any, 0))).unwrap();
+        let port = sock.local_addr().unwrap().port();
+        let clone = sock.try_clone().unwrap();
+        clone.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+        let received = Arc::new(AtomicBool::new(false));
+        let r2 = received.clone();
+        std::thread::spawn(move || {
+            let mut buf = [0u8; 128];
+            if let Ok((n, _)) = clone.recv_from(&mut buf) {
+                if n > 0 {
+                    r2.store(true, Ordering::SeqCst);
+                }
+            }
+        });
+        let sender = UdpSocket::bind(SocketAddr::from((any, 0))).unwrap();
+        sender
+            .send_to(b"hello", SocketAddr::from(([127, 0, 0, 1], port)))
+            .unwrap();
+        std::thread::sleep(Duration::from_millis(400));
+        assert!(
+            received.load(Ordering::SeqCst),
+            "UDP socket bind(0.0.0.0) + try_clone did not receive a loopback datagram"
+        );
+    }
+
+    #[test]
+    fn receiver_media_audio_dump_receives() {
+        let base = std::env::temp_dir().join("lumen_media_rtp_test.bin");
+        let _ = std::fs::remove_file(&base);
+        let derived = std::env::temp_dir().join("lumen_media_rtp_test_rtp.bin");
+        let _ = std::fs::remove_file(&derived);
+        let m = ReceiverMedia::new(IpAddr::V4(Ipv4Addr::LOCALHOST), Some(base.clone())).unwrap();
+        let port = m.endpoints().audio_rtp_port;
+        let sender = UdpSocket::bind(SocketAddr::from((Ipv4Addr::UNSPECIFIED, 0))).unwrap();
+        sender
+            .send_to(b"\x80\x60testrtp", SocketAddr::from(([127, 0, 0, 1], port)))
+            .unwrap();
+        std::thread::sleep(Duration::from_millis(600));
+        let exists = derived.exists();
+        let len = if exists { std::fs::metadata(&derived).unwrap().len() } else { 0 };
+        eprintln!("media test: port={port} derived={:?} exists={exists} len={len}", derived);
+        assert!(exists, "audio dump (derived) not created (port={port})");
+        assert!(len > 0, "audio dump empty (port={port}, len={len})");
+    }
+}
+
