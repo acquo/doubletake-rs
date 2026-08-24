@@ -16,7 +16,7 @@ use windows::Win32::System::Com::{
     CoCreateInstance, CoInitializeEx, CoTaskMemFree, CoUninitialize, CLSCTX_ALL,
     COINIT_MULTITHREADED,
 };
-use windows::Win32::System::Threading::{CreateEventW, WaitForSingleObject, INFINITE};
+use windows::Win32::System::Threading::{CreateEventW, SetEvent, WaitForSingleObject, INFINITE};
 
 /// KSDATAFORMAT_SUBTYPE_PCM
 const SUBTYPE_PCM: windows::core::GUID =
@@ -41,10 +41,17 @@ pub enum AudioError {
     ThreadGone,
 }
 
+/// HANDLE is a raw pointer and not Send; wrap for crossing thread boundaries.
+#[derive(Clone, Copy)]
+struct SendHandle(HANDLE);
+unsafe impl Send for SendHandle {}
+
 /// An open loopback capture. Frames arrive on [`LoopbackCapture::rx`].
 pub struct LoopbackCapture {
     rx: Receiver<Vec<i16>>,
     thread: Option<std::thread::JoinHandle<()>>,
+    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    event: SendHandle,
 }
 
 impl LoopbackCapture {
@@ -62,6 +69,11 @@ impl LoopbackCapture {
 
 impl Drop for LoopbackCapture {
     fn drop(&mut self) {
+        self.stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        // Wake the capture thread's wait so it can exit and be joined.
+        unsafe {
+            let _ = SetEvent(self.event.0);
+        }
         if let Some(t) = self.thread.take() {
             let _ = t.join();
         }
@@ -71,10 +83,13 @@ impl Drop for LoopbackCapture {
 /// Starts capturing the default render device's loopback output.
 pub fn start() -> Result<LoopbackCapture, AudioError> {
     let (tx, rx) = channel();
+    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let stop_thread = stop.clone();
+    let event = SendHandle(unsafe { CreateEventW(None, false, false, None)? });
     let thread = std::thread::Builder::new()
         .name("dt-audio-wasapi".into())
         .spawn(move || {
-            if let Err(e) = run(tx) {
+            if let Err(e) = run(tx, stop_thread, event) {
                 log::error!("WASAPI capture failed: {e}");
             }
         })
@@ -82,20 +97,30 @@ pub fn start() -> Result<LoopbackCapture, AudioError> {
     Ok(LoopbackCapture {
         rx,
         thread: Some(thread),
+        stop,
+        event,
     })
 }
 
-fn run(tx: Sender<Vec<i16>>) -> Result<(), AudioError> {
+fn run(
+    tx: Sender<Vec<i16>>,
+    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    event: SendHandle,
+) -> Result<(), AudioError> {
     unsafe {
         // MTA so the capture thread can drive COM objects directly.
         let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
     }
-    let result = run_inner(tx);
+    let result = run_inner(tx, stop, event.0);
     unsafe { CoUninitialize() };
     result
 }
 
-fn run_inner(tx: Sender<Vec<i16>>) -> Result<(), AudioError> {
+fn run_inner(
+    tx: Sender<Vec<i16>>,
+    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    event: HANDLE,
+) -> Result<(), AudioError> {
     let enumerator: IMMDeviceEnumerator =
         unsafe { CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_ALL)? };
     let device = unsafe { enumerator.GetDefaultAudioEndpoint(eRender, eConsole)? };
@@ -165,8 +190,11 @@ fn run_inner(tx: Sender<Vec<i16>>) -> Result<(), AudioError> {
     let capture: IAudioCaptureClient = unsafe { client.GetService()? };
     let buffer_frames = unsafe { client.GetBufferSize()? } as usize;
 
-    let event: HANDLE = unsafe { CreateEventW(None, false, false, None)? };
     unsafe { client.SetEventHandle(event)? };
+
+    // Capture streams only deliver buffers after Start(); without it the event
+    // never fires and the loop waits forever.
+    unsafe { client.Start()? };
 
     // Engine gives us exactly 44.1k stereo when the preferred format worked.
     let resample = src_rate != SAMPLE_RATE || src_channels != CHANNELS as u16;
@@ -186,6 +214,9 @@ fn run_inner(tx: Sender<Vec<i16>>) -> Result<(), AudioError> {
     );
 
     loop {
+        if stop.load(std::sync::atomic::Ordering::Relaxed) {
+            break;
+        }
         let wait = unsafe { WaitForSingleObject(event, INFINITE) };
         if wait != WAIT_OBJECT_0 {
             break;

@@ -52,6 +52,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut no_encrypt = false;
     let mut no_audio = false;
     let mut volume_db: Option<f64> = None;
+    let mut seconds: u64 = 0; // 0 = run until Ctrl+C
     let mut i = 3;
     while i < args.len() {
         match args[i].as_str() {
@@ -73,6 +74,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             "--volume-db" => {
                 i += 1;
                 volume_db = Some(args[i].parse()?);
+            }
+            "--seconds" => {
+                i += 1;
+                seconds = args[i].parse()?;
             }
             s if s.starts_with("--") => {
                 eprintln!("unknown option: {s}");
@@ -241,7 +246,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut idle_flushed = false;
     let start = Instant::now();
 
-    while !stop.load(Ordering::Relaxed) {
+    while !stop.load(Ordering::Relaxed) && (seconds == 0 || start.elapsed().as_secs() < seconds) {
         match dup.acquire_frame_cpu(1000)? {
             Some(frame) => {
                 let bytes = encoder.encode_bgra(
