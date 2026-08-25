@@ -1,0 +1,9 @@
+# Makes the x264 / x264-sys crates resolve libx264 via pkg-config.
+# This machine's libx264 (0.164.13) is bundled with GStreamer's runtime; point
+# pkg-config at its pkgconfig dir so `cargo build` finds it without manually
+# exporting PKG_CONFIG_PATH each time.
+#
+# NOTE: machine-specific. If GStreamer moves/removes, update this path or build
+# with PKG_CONFIG_PATH pointed at another libx264 install.
+[env]
+PKG_CONFIG_PATH = "C:\\Program Files\\gstreamer\\1.0\\msvc_x86_64\\lib\\pkgconfig"

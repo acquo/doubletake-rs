@@ -7,10 +7,12 @@ pub mod encoder;
 pub mod mf;
 pub mod nvenc;
 pub mod openh264;
+pub mod x264;
 pub mod yuv;
 
 pub use encoder::{baseline_guid, main_guid, preset_p4_guid, H264Encoder};
 pub use mf::{MediaFoundationEncoder, MfError};
+pub use x264::{X264Encoder, X264Error};
 pub use yuv::{bgra_to_i420, i420_to_nv12};
 pub use nvenc::{
     NvEncoder, NvEncoderError, NV_ENC_BUFFER_FORMAT_ARGB, NV_ENC_DEVICE_TYPE_DIRECTX,

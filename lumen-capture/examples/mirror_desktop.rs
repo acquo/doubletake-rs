@@ -29,6 +29,7 @@ use lumen_airplay::pairing::PairingSession;
 use lumen_capture::dxgi::DesktopDuplicator;
 use lumen_encode::mf::MediaFoundationEncoder;
 use lumen_encode::openh264::{OpenH264Config, OpenH264Encoder};
+use lumen_encode::x264::X264Encoder;
 use lumen_encode::yuv::{bgra_to_i420, i420_to_nv12};
 use std::io::Write;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -233,9 +234,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let use_nvenc = encoder_kind == "nvenc";
     let use_mf = encoder_kind == "mf";
+    let use_x264 = encoder_kind == "x264";
     let mut nvenc: Option<lumen_encode::H264Encoder> = None;
     let mut openh264: Option<OpenH264Encoder> = None;
     let mut mf: Option<MediaFoundationEncoder> = None;
+    let mut x264: Option<X264Encoder> = None;
 
     if use_nvenc {
         let nv = std::sync::Arc::new(lumen_encode::NvEncoder::load()?);
@@ -260,6 +263,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             bitrate_kbps * 1000,
         )?);
         println!("MediaFoundation H.264 MFT ready ({bitrate_kbps} kbps, {fps} fps)");
+    } else if use_x264 {
+        x264 = Some(X264Encoder::new(dup.width, dup.height, fps, bitrate_kbps * 1000)?);
+        println!("x264 encoder ready ({bitrate_kbps} kbps, {fps} fps, ultrafast/zerolatency)");
     } else {
         openh264 = Some(OpenH264Encoder::new(OpenH264Config {
             bitrate_bps: bitrate_kbps * 1000,
@@ -363,6 +369,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                     &yy, &uu, &vv, frame.width as usize, frame.height as usize,
                                 );
                                 enc.encode_nv12(&nv12, streamer.frames_sent == 0)?
+                            } else if let Some(enc) = &mut x264 {
+                                enc.encode_bgra(
+                                    &frame.bgra,
+                                    frame.width,
+                                    frame.height,
+                                    frame.width * 4,
+                                    streamer.frames_sent == 0,
+                                )?
                             } else {
                                 let enc = openh264.as_mut().expect("openh264");
                                 enc.encode_bgra(
