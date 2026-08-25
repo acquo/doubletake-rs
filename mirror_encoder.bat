@@ -15,21 +15,22 @@ set "HOST=%~2"
 if "%HOST%"=="" set "HOST=192.168.1.107"
 
 set "ENC=%~1"
-if "%ENC%"=="" (
-    echo Select encoder:
-    echo   1) nvenc     NVIDIA hardware (RTX)
-    echo   2) openh264  CPU software
-    echo   3) x264      CPU software, 4:2:0 baseline
-    echo   4) mf        MediaFoundation hardware (Intel QSV / NVIDIA NVENC)
-    set /p "ENC=Choice [1-4]: "
-)
+if not "%ENC%"=="" goto haveenc
 
+echo Select encoder:
+echo   1. nvenc     NVIDIA hardware
+echo   2. openh264  CPU software
+echo   3. x264      CPU software, 4:2:0 baseline
+echo   4. mf        MediaFoundation hardware, QSV / NVENC
+set /p "ENC=Choice [1-4]: "
+
+:haveenc
 if "!ENC!"=="1" set "ENC=nvenc"
 if "!ENC!"=="2" set "ENC=openh264"
 if "!ENC!"=="3" set "ENC=x264"
 if "!ENC!"=="4" set "ENC=mf"
 
-rem x264 builds against / runs with the GStreamer-bundled libx264 on this machine.
+rem x264 builds against and runs with the GStreamer-bundled libx264 on this machine.
 rem Set the env so a fresh build and the runtime DLL are both found.
 if exist "C:\Program Files\gstreamer\1.0\msvc_x86_64\bin" (
     set "PATH=C:\Program Files\gstreamer\1.0\msvc_x86_64\bin;!PATH!"
