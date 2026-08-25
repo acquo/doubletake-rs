@@ -15,9 +15,9 @@ use windows::Win32::Media::MediaFoundation::{
     MFCreateMediaType, MFCreateMemoryBuffer, MFCreateSample, MFT_OUTPUT_DATA_BUFFER,
     MFMediaType_Video, MFVideoFormat_H264, MFVideoFormat_NV12, MFVideoInterlace_Progressive,
     MF_MT_AVG_BITRATE, MF_MT_FRAME_RATE, MF_MT_FRAME_SIZE, MF_MT_INTERLACE_MODE, MF_MT_MAJOR_TYPE,
-    MF_MT_SUBTYPE, MF_VERSION,
+    MF_MT_SUBTYPE, MF_LOW_LATENCY, MF_VERSION,
 };
-use windows::Win32::System::Com::{CoCreateInstance, CLSCTX_INPROC_SERVER};
+use windows::Win32::System::Com::{CoCreateInstance, CoInitializeEx, CLSCTX_INPROC_SERVER, COINIT_MULTITHREADED};
 
 #[derive(thiserror::Error, Debug)]
 pub enum MfError {
@@ -42,19 +42,27 @@ pub struct MediaFoundationEncoder {
     width: u32,
     height: u32,
     frame_index: i64,
-    output_sample: Option<IMFSample>,
     initialized: bool,
 }
 
 impl MediaFoundationEncoder {
     pub fn new(width: u32, height: u32, fps: u32, bitrate: u32) -> Result<Self, MfError> {
         unsafe {
+            let _ = CoInitializeEx(None, COINIT_MULTITHREADED).ok();
             MFStartup(MF_VERSION, 0)?;
         }
 
         let transform: IMFTransform = unsafe {
             CoCreateInstance(&CMSH264EncoderMFT, None, CLSCTX_INPROC_SERVER)?
         };
+
+        // Low latency (no B-frames) so each input frame immediately yields output
+        // — essential for screen mirroring.
+        unsafe {
+            if let Ok(attrs) = transform.GetAttributes() {
+                let _ = attrs.SetUINT32(&MF_LOW_LATENCY, 1);
+            }
+        }
 
         // ---- Output media type: H.264 / video / progressive.
         let out_type: IMFMediaType = unsafe { MFCreateMediaType()? };
@@ -64,7 +72,7 @@ impl MediaFoundationEncoder {
             out_type.SetUINT32(&MF_MT_AVG_BITRATE, bitrate)?;
             out_type.SetUINT32(&MF_MT_INTERLACE_MODE, MFVideoInterlace_Progressive.0 as u32)?;
             // MF_MT_FRAME_SIZE packs (height << 32) | width (u64).
-            out_type.SetUINT64(&MF_MT_FRAME_SIZE, ((height as u64) << 32) | width as u64)?;
+            out_type.SetUINT64(&MF_MT_FRAME_SIZE, ((width as u64) << 32) | height as u64)?;
             // MF_MT_FRAME_RATE packs (num << 32) | den (u64).
             out_type.SetUINT64(&MF_MT_FRAME_RATE, ((fps as u64) << 32) | 1)?;
             transform.SetOutputType(0, Some(&out_type), 0)?;
@@ -75,7 +83,7 @@ impl MediaFoundationEncoder {
         unsafe {
             in_type.SetGUID(&MF_MT_MAJOR_TYPE, &MFMediaType_Video)?;
             in_type.SetGUID(&MF_MT_SUBTYPE, &MFVideoFormat_NV12)?;
-            in_type.SetUINT64(&MF_MT_FRAME_SIZE, ((height as u64) << 32) | width as u64)?;
+            in_type.SetUINT64(&MF_MT_FRAME_SIZE, ((width as u64) << 32) | height as u64)?;
             in_type.SetUINT64(&MF_MT_FRAME_RATE, ((fps as u64) << 32) | 1)?;
             transform.SetInputType(0, Some(&in_type), 0)?;
         }
@@ -85,7 +93,6 @@ impl MediaFoundationEncoder {
             width,
             height,
             frame_index: 0,
-            output_sample: None,
             initialized: true,
         })
     }
@@ -129,17 +136,8 @@ impl MediaFoundationEncoder {
         let mut out = Vec::new();
         unsafe {
             for _ in 0..16 {
-                let sample: IMFSample = match &self.output_sample {
-                    Some(s) => s.clone(),
-                    None => {
-                        let s: IMFSample = MFCreateSample()?;
-                        let buf: IMFMediaBuffer = MFCreateMemoryBuffer(OUTPUT_BUFFER_BYTES)?;
-                        s.AddBuffer(&buf)?;
-                        self.output_sample = Some(s.clone());
-                        s
-                    }
-                };
-                sample.RemoveAllBuffers()?;
+                // Fresh output sample each call: cleanest lifetime for the MFT.
+                let sample: IMFSample = MFCreateSample()?;
                 let buf: IMFMediaBuffer = MFCreateMemoryBuffer(OUTPUT_BUFFER_BYTES)?;
                 sample.AddBuffer(&buf)?;
 
@@ -167,7 +165,7 @@ impl MediaFoundationEncoder {
                         out.extend_from_slice(&bytes);
                     }
                 }
-                // Drain until the MFT reports it has no more output for this input.
+                // Stop after the MFT reports a successful, non-pending output.
                 if output.dwStatus == 0 {
                     break;
                 }
